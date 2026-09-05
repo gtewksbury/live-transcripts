@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/LiveTranscripts/LiveTranscripts.csproj" />
+  <Project Path="tests/LiveTranscripts.Tests/LiveTranscripts.Tests.csproj" />
+</Solution>
