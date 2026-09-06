@@ -14,6 +14,8 @@ internal interface IAudioCapture : IAsyncDisposable
 {
     event Action<ReadOnlyMemory<byte>>? AudioAvailable;
 
+    event Action? TerminalFailure;
+
     Task StartAsync(CancellationToken cancellationToken);
 
     Task StopAsync(CancellationToken cancellationToken);
@@ -31,6 +33,8 @@ internal interface ISpeechRecognizer : IAsyncDisposable
     event Action<FinalizedRecognition>? Finalized;
 
     event Action? RecoverableInterruption;
+
+    event Action<string>? TerminalFailure;
 
     Task StartAsync(CancellationToken cancellationToken);
 
@@ -52,13 +56,23 @@ internal sealed class InProcessLiveSessionController(
     IAudioCaptureFactory audioCaptureFactory,
     ISpeechRecognizerFactory speechRecognizerFactory,
     Func<string>? sessionIdFactory = null,
-    Func<CancellationToken, Task>? transcriptHoldback = null) : ILiveSessionController
+    Func<CancellationToken, Task>? transcriptHoldback = null,
+    TimeProvider? timeProvider = null,
+    Func<TimeSpan, CancellationToken, Task>? durationDelay = null) : ILiveSessionController
 {
+    private static readonly TimeSpan SessionDurationLimit = TimeSpan.FromHours(2);
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly Func<string> createSessionId = sessionIdFactory ?? (() => Guid.NewGuid().ToString("N"));
+    private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
+    private readonly Func<TimeSpan, CancellationToken, Task> waitForDurationLimit = durationDelay ??
+        ((duration, cancellationToken) => Task.Delay(
+            duration,
+            timeProvider ?? TimeProvider.System,
+            cancellationToken));
     private LiveTranscriptionSession? session;
     private LiveSessionStatus? status;
     private TaskCompletionSource<LiveSessionStatus>? terminalStatus;
+    private CancellationTokenSource? durationCancellation;
 
     internal event Action<LiveSessionStatus>? StatusChanged;
 
@@ -84,6 +98,7 @@ internal sealed class InProcessLiveSessionController(
                 speechRecognizerFactory,
                 transcriptHoldback);
             candidate.WriteFailed += HandleWriteFailure;
+            candidate.TerminalFailure += HandleTerminalFailure;
             candidate.RecognitionStateChanged += HandleRecognitionStateChanged;
             terminalStatus = new TaskCompletionSource<LiveSessionStatus>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
@@ -95,6 +110,7 @@ internal sealed class InProcessLiveSessionController(
             catch
             {
                 candidate.WriteFailed -= HandleWriteFailure;
+                candidate.TerminalFailure -= HandleTerminalFailure;
                 candidate.RecognitionStateChanged -= HandleRecognitionStateChanged;
                 await candidate.DisposeAsync();
                 throw;
@@ -106,8 +122,11 @@ internal sealed class InProcessLiveSessionController(
                 "running",
                 request.OutputPath,
                 request.MicrophoneId,
-                request.PlaybackId);
+                request.PlaybackId,
+                StartedAtUtc: clock.GetUtcNow());
             StatusChanged?.Invoke(status);
+            durationCancellation = new CancellationTokenSource();
+            _ = StopAtDurationLimitAsync(sessionId, durationCancellation.Token);
             return status;
         }
         finally
@@ -145,12 +164,18 @@ internal sealed class InProcessLiveSessionController(
                 return null;
             }
 
+            durationCancellation?.Cancel();
             session.WriteFailed -= HandleWriteFailure;
+            session.TerminalFailure -= HandleTerminalFailure;
             session.RecognitionStateChanged -= HandleRecognitionStateChanged;
             await session.StopAsync(cancellationToken);
             await session.DisposeAsync();
             session = null;
-            status = status! with { State = "stopped" };
+            status = WithElapsed(status! with
+            {
+                State = "stopped",
+                StopReason = LiveSessionStopReasons.Requested,
+            });
             return status;
         }
         finally
@@ -162,13 +187,67 @@ internal sealed class InProcessLiveSessionController(
     private bool Matches(string? sessionId) => status is not null &&
         (sessionId is null || string.Equals(sessionId, status.SessionId, StringComparison.Ordinal));
 
+    private async Task StopAtDurationLimitAsync(
+        string sessionId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await waitForDurationLimit(SessionDurationLimit, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        await gate.WaitAsync(CancellationToken.None);
+
+        try
+        {
+            if (session is null || status?.SessionId != sessionId)
+            {
+                return;
+            }
+
+            session.WriteFailed -= HandleWriteFailure;
+            session.TerminalFailure -= HandleTerminalFailure;
+            session.RecognitionStateChanged -= HandleRecognitionStateChanged;
+            await session.StopAsync(CancellationToken.None);
+            var markerWritten = session.AppendDurationLimitMarker();
+            await session.DisposeAsync();
+            session = null;
+            status = markerWritten
+                ? WithElapsed(status with
+                {
+                    State = "stopped",
+                    StopReason = LiveSessionStopReasons.DurationLimit,
+                })
+                : status with
+                {
+                    State = "failed",
+                    StopReason = LiveSessionStopReasons.WriteFailure,
+                    ErrorCode = "transcript-write-failed",
+                    ErrorMessage = "The duration-limit marker could not be written.",
+                    ElapsedDuration = GetElapsedDuration(status),
+                };
+            terminalStatus!.TrySetResult(status);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     internal Task<LiveSessionStatus> WaitForTerminalStatusAsync(
         CancellationToken cancellationToken) => terminalStatus is null
             ? Task.FromException<LiveSessionStatus>(new InvalidOperationException("The session has not started."))
             : terminalStatus.Task.WaitAsync(cancellationToken);
 
     private void HandleWriteFailure(LiveSessionException exception) =>
-        _ = TransitionToWriteFailureAsync(exception);
+        _ = TransitionToTerminalFailureAsync(exception, LiveSessionStopReasons.WriteFailure);
+
+    private void HandleTerminalFailure(LiveSessionException exception, string stopReason) =>
+        _ = TransitionToTerminalFailureAsync(exception, stopReason);
 
     private void HandleRecognitionStateChanged(
         TranscriptSource source,
@@ -215,7 +294,9 @@ internal sealed class InProcessLiveSessionController(
         }
     }
 
-    private async Task TransitionToWriteFailureAsync(LiveSessionException exception)
+    private async Task TransitionToTerminalFailureAsync(
+        LiveSessionException exception,
+        string stopReason)
     {
         await gate.WaitAsync(CancellationToken.None);
 
@@ -227,6 +308,7 @@ internal sealed class InProcessLiveSessionController(
             }
 
             session.WriteFailed -= HandleWriteFailure;
+            session.TerminalFailure -= HandleTerminalFailure;
             session.RecognitionStateChanged -= HandleRecognitionStateChanged;
 
             try
@@ -251,6 +333,8 @@ internal sealed class InProcessLiveSessionController(
                 State = "failed",
                 ErrorCode = exception.Code,
                 ErrorMessage = exception.Message,
+                StopReason = stopReason,
+                ElapsedDuration = GetElapsedDuration(status),
             };
             terminalStatus!.TrySetResult(status);
         }
@@ -259,6 +343,13 @@ internal sealed class InProcessLiveSessionController(
             gate.Release();
         }
     }
+
+    private LiveSessionStatus WithElapsed(LiveSessionStatus value) =>
+        value with { ElapsedDuration = GetElapsedDuration(value) };
+
+    private TimeSpan GetElapsedDuration(LiveSessionStatus value) => value.StartedAtUtc is null
+        ? value.ElapsedDuration
+        : clock.GetUtcNow() - value.StartedAtUtc.Value;
 }
 
 internal sealed class LiveTranscriptionSession : IAsyncDisposable
@@ -299,9 +390,15 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
             meetingRecognizer,
             OnRecognitionStateChanged,
             transcriptOrdering.AddInterruptionMarker);
+        microphoneCapture.TerminalFailure += HandleMicrophoneFailure;
+        playbackCapture.TerminalFailure += HandlePlaybackFailure;
+        youRecognizer.TerminalFailure += HandleYouRecognitionFailure;
+        meetingRecognizer.TerminalFailure += HandleMeetingRecognitionFailure;
     }
 
     public event Action<LiveSessionException>? WriteFailed;
+
+    public event Action<LiveSessionException, string>? TerminalFailure;
 
     public event Action<TranscriptSource, bool, bool>? RecognitionStateChanged;
 
@@ -359,6 +456,10 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     {
         microphoneCapture.AudioAvailable -= youStream.WriteAudio;
         playbackCapture.AudioAvailable -= meetingStream.WriteAudio;
+        microphoneCapture.TerminalFailure -= HandleMicrophoneFailure;
+        playbackCapture.TerminalFailure -= HandlePlaybackFailure;
+        youRecognizer.TerminalFailure -= HandleYouRecognitionFailure;
+        meetingRecognizer.TerminalFailure -= HandleMeetingRecognitionFailure;
         youStream.Finalized -= WriteYou;
         meetingStream.Finalized -= WriteMeeting;
         await microphoneCapture.DisposeAsync();
@@ -392,6 +493,41 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     private void WriteMeeting(FinalizedRecognition result) =>
         transcriptOrdering.Add(TranscriptSource.Meeting, result);
 
+    public bool AppendDurationLimitMarker() => AppendTranscriptText(
+        $"> Transcription stopped: two-hour session limit reached.{Environment.NewLine}{Environment.NewLine}");
+
+    private void HandleMicrophoneFailure() => TerminalFailure?.Invoke(
+        new LiveSessionException(
+            "audio-device-lost",
+            "The selected microphone audio endpoint is no longer available."),
+        LiveSessionStopReasons.DeviceFailure);
+
+    private void HandlePlaybackFailure() => TerminalFailure?.Invoke(
+        new LiveSessionException(
+            "audio-device-lost",
+            "The selected playback audio endpoint is no longer available."),
+        LiveSessionStopReasons.DeviceFailure);
+
+    private void HandleYouRecognitionFailure(string errorCode) =>
+        HandleRecognitionFailure(TranscriptSource.You, errorCode);
+
+    private void HandleMeetingRecognitionFailure(string errorCode) =>
+        HandleRecognitionFailure(TranscriptSource.Meeting, errorCode);
+
+    private void HandleRecognitionFailure(TranscriptSource source, string errorCode)
+    {
+        var sanitizedCode = new string(errorCode
+            .Where(character => char.IsAsciiLetterOrDigit(character) || character == '-')
+            .Take(64)
+            .ToArray());
+        var sourceName = source == TranscriptSource.You ? "you" : "meeting";
+        TerminalFailure?.Invoke(
+            new LiveSessionException(
+                "azure-recognition-failed",
+                $"Azure Speech recognition failed for {sourceName} ({sanitizedCode})."),
+            LiveSessionStopReasons.AzureFailure);
+    }
+
     private void WriteFinalized(TranscriptSource source, string text)
     {
         if (string.IsNullOrWhiteSpace(text) || Volatile.Read(ref writeFailureSignaled) != 0)
@@ -411,7 +547,7 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
             $"{Environment.NewLine}{Environment.NewLine}");
     }
 
-    private void AppendTranscriptText(string text)
+    private bool AppendTranscriptText(string text)
     {
         try
         {
@@ -427,6 +563,8 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
                     text,
                     new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             }
+
+                    return true;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
@@ -436,6 +574,8 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
                     "transcript-write-failed",
                     $"The transcript could not be written: {exception.Message}"));
             }
+
+            return false;
         }
     }
 }

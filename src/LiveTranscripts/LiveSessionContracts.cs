@@ -17,7 +17,22 @@ internal sealed record LiveSessionStatus(
     string YouRecognitionState = "running",
     string MeetingRecognitionState = "running",
     bool YouSpeechLost = false,
-    bool MeetingSpeechLost = false);
+    bool MeetingSpeechLost = false,
+    string? StopReason = null,
+    DateTimeOffset? StartedAtUtc = null,
+    TimeSpan ElapsedDuration = default);
+
+internal static class LiveSessionStopReasons
+{
+    public const string Requested = "requested";
+    public const string StartupFailure = "startup-failure";
+    public const string StopTimeout = "stop-timeout";
+    public const string DurationLimit = "duration-limit";
+    public const string DeviceFailure = "device-failure";
+    public const string AzureFailure = "azure-failure";
+    public const string WriteFailure = "write-failure";
+    public const string WorkerFailure = "worker-failure";
+}
 
 internal interface ILiveSessionController
 {

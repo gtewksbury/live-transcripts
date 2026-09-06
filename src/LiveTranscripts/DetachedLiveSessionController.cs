@@ -17,6 +17,7 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
     private readonly IDetachedWorkerControl workerControl;
     private readonly TimeProvider timeProvider;
     private readonly Func<string> sessionIdFactory;
+    private readonly Func<TimeSpan, CancellationToken, Task> delay;
 
     public DetachedLiveSessionController()
         : this(
@@ -31,12 +32,15 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
         ISessionStateStore stateStore,
         IDetachedWorkerControl workerControl,
         TimeProvider timeProvider,
-        Func<string> sessionIdFactory)
+        Func<string> sessionIdFactory,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         this.stateStore = stateStore;
         this.workerControl = workerControl;
         this.timeProvider = timeProvider;
         this.sessionIdFactory = sessionIdFactory;
+        this.delay = delay ?? ((duration, cancellationToken) =>
+            Task.Delay(duration, timeProvider, cancellationToken));
     }
 
     public async Task<LiveSessionStatus> StartAsync(
@@ -62,17 +66,13 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
         }
 
         var sessionId = sessionIdFactory();
-        await stateStore.WriteAsync(
-            SessionStateDocument.Starting(sessionId, request),
-            cancellationToken);
-
         using var worker = await workerControl.LaunchAsync(
             sessionId,
             request,
             cancellationToken);
-        var startedAt = timeProvider.GetTimestamp();
+        var elapsed = TimeSpan.Zero;
 
-        while (timeProvider.GetElapsedTime(startedAt) < StartupTimeout)
+        while (elapsed < StartupTimeout)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var state = await stateStore.ReadAsync(cancellationToken);
@@ -84,6 +84,11 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
 
             if (state?.SessionId == sessionId && state.State == "failed")
             {
+                if (!worker.HasExited)
+                {
+                    worker.Kill();
+                }
+
                 throw new LiveSessionException(
                     state.ErrorCode ?? "session-start-failed",
                     state.Error ?? "The live transcription worker failed during startup.");
@@ -91,15 +96,30 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
 
             if (worker.HasExited)
             {
+                await stateStore.WriteAsync(
+                    SessionStateDocument.Failed(
+                        sessionId,
+                        request,
+                        "The live transcription worker exited before becoming ready.",
+                        "worker-start-failed"),
+                    cancellationToken);
                 throw new LiveSessionException(
                     "worker-start-failed",
                     "The live transcription worker exited before becoming ready.");
             }
 
-            await Task.Delay(PollInterval, timeProvider, cancellationToken);
+            await delay(PollInterval, cancellationToken);
+            elapsed += PollInterval;
         }
 
         worker.Kill();
+        await stateStore.WriteAsync(
+            SessionStateDocument.Failed(
+                sessionId,
+                request,
+                "The live transcription worker did not become ready within 15 seconds.",
+                "session-start-timeout"),
+            cancellationToken);
         throw new LiveSessionException(
             "session-start-timeout",
             "The live transcription worker did not become ready within 15 seconds.");
@@ -109,15 +129,28 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
         string? sessionId,
         CancellationToken cancellationToken)
     {
-        var state = await stateStore.ReadAsync(cancellationToken);
-        return Matches(state, sessionId) ? state!.ToStatus() : null;
+        var state = await ReadReconciledStateAsync(cancellationToken);
+        if (!Matches(state, sessionId))
+        {
+            return null;
+        }
+
+        var status = state!.ToStatus();
+        return status.State is "running" or "degraded" && status.StartedAtUtc is not null
+            ? status with
+            {
+                ElapsedDuration = GetElapsedDuration(
+                    status.StartedAtUtc,
+                    status.ElapsedDuration),
+            }
+            : status;
     }
 
     public async Task<LiveSessionStatus?> StopAsync(
         string? sessionId,
         CancellationToken cancellationToken)
     {
-        var state = await stateStore.ReadAsync(cancellationToken);
+        var state = await ReadReconciledStateAsync(cancellationToken);
 
         if (!Matches(state, sessionId) || state!.State is not ("running" or "degraded"))
         {
@@ -131,6 +164,19 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
             StopTimeout,
             cancellationToken))
         {
+            workerControl.Terminate(state.ProcessId);
+            await stateStore.WriteAsync(
+                state with
+                {
+                    State = "failed",
+                    ErrorCode = "session-stop-timeout",
+                    Error = "The live transcription worker did not stop within five seconds.",
+                    StopReason = LiveSessionStopReasons.StopTimeout,
+                    ElapsedDuration = GetElapsedDuration(
+                        state.StartedAtUtc,
+                        state.ElapsedDuration),
+                },
+                cancellationToken);
             throw new LiveSessionException(
                 "session-stop-timeout",
                 "The live transcription worker did not stop within five seconds.");
@@ -139,6 +185,36 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
         var finalState = await stateStore.ReadAsync(cancellationToken);
         return Matches(finalState, state.SessionId) ? finalState!.ToStatus() : null;
     }
+
+    private async Task<SessionStateDocument?> ReadReconciledStateAsync(
+        CancellationToken cancellationToken)
+    {
+        var state = await stateStore.ReadAsync(cancellationToken);
+
+        if (state?.State is not ("starting" or "running" or "degraded") || workerControl.IsActive)
+        {
+            return state;
+        }
+
+        state = state with
+        {
+            State = "failed",
+            ErrorCode = "session-worker-stale",
+            Error = "The live transcription worker is no longer running.",
+            StopReason = LiveSessionStopReasons.WorkerFailure,
+            ElapsedDuration = GetElapsedDuration(
+                state.StartedAtUtc,
+                state.ElapsedDuration),
+        };
+        await stateStore.WriteAsync(state, cancellationToken);
+        return state;
+    }
+
+    private TimeSpan GetElapsedDuration(
+        DateTimeOffset? startedAtUtc,
+        TimeSpan elapsedDuration) => startedAtUtc is null
+            ? elapsedDuration
+            : timeProvider.GetUtcNow() - startedAtUtc.Value;
 
     private static bool Matches(SessionStateDocument? state, string? sessionId) =>
         state is not null &&
@@ -180,6 +256,8 @@ internal interface IDetachedWorkerControl
         int processId,
         TimeSpan timeout,
         CancellationToken cancellationToken);
+
+    void Terminate(int processId);
 }
 
 internal sealed class WindowsDetachedWorkerControl : IDetachedWorkerControl
@@ -289,6 +367,18 @@ internal sealed class WindowsDetachedWorkerControl : IDetachedWorkerControl
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             return false;
+        }
+    }
+
+    public void Terminate(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            process.Kill(entireProcessTree: true);
+        }
+        catch (ArgumentException)
+        {
         }
     }
 
@@ -462,7 +552,10 @@ internal sealed record SessionStateDocument(
     string YouRecognitionState = "running",
     string MeetingRecognitionState = "running",
     bool YouSpeechLost = false,
-    bool MeetingSpeechLost = false)
+    bool MeetingSpeechLost = false,
+    string? StopReason = null,
+    DateTimeOffset? StartedAtUtc = null,
+    TimeSpan ElapsedDuration = default)
 {
     public static SessionStateDocument Starting(string sessionId, StartSessionRequest request) =>
         new(sessionId, "starting", request.OutputPath, request.MicrophoneId, request.PlaybackId, 0, null, null);
@@ -480,7 +573,10 @@ internal sealed record SessionStateDocument(
             status.YouRecognitionState,
             status.MeetingRecognitionState,
             status.YouSpeechLost,
-            status.MeetingSpeechLost);
+            status.MeetingSpeechLost,
+            status.StopReason,
+            status.StartedAtUtc,
+            status.ElapsedDuration);
 
     public static SessionStateDocument Failed(
         string sessionId,
@@ -494,7 +590,8 @@ internal sealed record SessionStateDocument(
             request.PlaybackId,
             Environment.ProcessId,
             errorCode,
-            error);
+            error,
+            StopReason: LiveSessionStopReasons.StartupFailure);
 
     public LiveSessionStatus ToStatus() =>
         new(
@@ -508,7 +605,10 @@ internal sealed record SessionStateDocument(
             YouRecognitionState,
             MeetingRecognitionState,
             YouSpeechLost,
-            MeetingSpeechLost);
+            MeetingSpeechLost,
+            StopReason,
+            StartedAtUtc,
+            ElapsedDuration);
 }
 
 internal sealed class SessionStateStore : ISessionStateStore

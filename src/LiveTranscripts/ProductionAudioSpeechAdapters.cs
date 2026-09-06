@@ -42,9 +42,12 @@ internal sealed class WasapiPcmCapture : IAudioCapture
             ResamplerQuality = 60,
         };
         capture.DataAvailable += OnDataAvailable;
+        capture.RecordingStopped += OnRecordingStopped;
     }
 
     public event Action<ReadOnlyMemory<byte>>? AudioAvailable;
+
+    public event Action? TerminalFailure;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -81,6 +84,7 @@ internal sealed class WasapiPcmCapture : IAudioCapture
         }
 
         capture.DataAvailable -= OnDataAvailable;
+        capture.RecordingStopped -= OnRecordingStopped;
         resampler.Dispose();
         capture.Dispose();
         device.Dispose();
@@ -89,6 +93,14 @@ internal sealed class WasapiPcmCapture : IAudioCapture
 
     private void OnDataAvailable(object? sender, WaveInEventArgs eventArgs) =>
         bufferedAudio.AddSamples(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
+
+    private void OnRecordingStopped(object? sender, StoppedEventArgs eventArgs)
+    {
+        if (eventArgs.Exception is not null && !pumpCancellation.IsCancellationRequested)
+        {
+            TerminalFailure?.Invoke();
+        }
+    }
 
     private async Task PumpAsync(CancellationToken cancellationToken)
     {
@@ -111,6 +123,10 @@ internal sealed class WasapiPcmCapture : IAudioCapture
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+        }
+        catch
+        {
+            TerminalFailure?.Invoke();
         }
     }
 }
@@ -207,6 +223,8 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
 
     public event Action? RecoverableInterruption;
 
+    public event Action<string>? TerminalFailure;
+
     public Task StartAsync(CancellationToken cancellationToken) =>
         recognizer.StartContinuousRecognitionAsync().WaitAsync(cancellationToken);
 
@@ -252,7 +270,16 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
     {
         if (eventArgs.Reason == CancellationReason.Error)
         {
-            RecoverableInterruption?.Invoke();
+            if (eventArgs.ErrorCode is CancellationErrorCode.ConnectionFailure or
+                CancellationErrorCode.ServiceTimeout or
+                CancellationErrorCode.ServiceUnavailable)
+            {
+                RecoverableInterruption?.Invoke();
+            }
+            else
+            {
+                TerminalFailure?.Invoke(eventArgs.ErrorCode.ToString());
+            }
         }
     }
 

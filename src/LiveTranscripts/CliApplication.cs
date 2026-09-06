@@ -233,6 +233,8 @@ internal sealed class CliApplication
                 status.OutputPath,
                 status.MicrophoneId,
                 status.PlaybackId,
+                status.StopReason,
+                ElapsedSeconds = status.ElapsedDuration.TotalSeconds,
                 Sources = new
                 {
                     You = new
@@ -255,6 +257,8 @@ internal sealed class CliApplication
                 status.OutputPath,
                 status.MicrophoneId,
                 status.PlaybackId,
+                status.StopReason,
+                ElapsedSeconds = status.ElapsedDuration.TotalSeconds,
                 Sources = new
                 {
                     You = new

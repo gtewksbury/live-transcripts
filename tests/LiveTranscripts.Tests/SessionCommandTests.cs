@@ -202,6 +202,15 @@ public sealed class SessionCommandTests
             Assert.AreEqual(0, stopExitCode);
             using var stopped = JsonDocument.Parse(stopOutput.ToString());
             Assert.AreEqual("stopped", stopped.RootElement.GetProperty("state").GetString());
+            Assert.AreEqual("requested", stopped.RootElement.GetProperty("stopReason").GetString());
+            Assert.AreEqual(outputPath, stopped.RootElement.GetProperty("outputPath").GetString());
+            Assert.AreEqual(
+                "microphone-1",
+                stopped.RootElement.GetProperty("microphoneId").GetString());
+            Assert.AreEqual(
+                "playback-1",
+                stopped.RootElement.GetProperty("playbackId").GetString());
+            Assert.IsTrue(stopped.RootElement.GetProperty("elapsedSeconds").GetDouble() >= 0);
         }
         finally
         {
@@ -916,6 +925,7 @@ public sealed class SessionCommandTests
             Assert.AreEqual(
                 "transcript-write-failed",
                 status.GetProperty("error").GetProperty("code").GetString());
+            Assert.AreEqual("write-failure", status.GetProperty("stopReason").GetString());
             Assert.IsFalse(File.Exists(outputPath));
             Assert.IsTrue(captures.Microphone.IsStopped);
             Assert.IsTrue(captures.Playback.IsStopped);
@@ -1022,10 +1032,211 @@ public sealed class SessionCommandTests
             Assert.AreEqual(
                 "transcript-write-failed",
                 status.GetProperty("error").GetProperty("code").GetString());
+            Assert.AreEqual("write-failure", status.GetProperty("stopReason").GetString());
             Assert.IsTrue(captures.Microphone.IsStopped);
             Assert.IsTrue(captures.Playback.IsStopped);
             Assert.IsTrue(recognizers.You.IsStopped);
             Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task SelectedEndpointDisappearanceStopsSessionWithDeviceFailure()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var captures = new ControlledAudioCaptureFactory();
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(stateStore, captures, recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            captures.Playback.Fail("The selected playback endpoint disappeared.");
+
+            var status = await WaitForStateAsync(application, "failed");
+            Assert.AreEqual("device-failure", status.GetProperty("stopReason").GetString());
+            Assert.AreEqual(
+                "audio-device-lost",
+                status.GetProperty("error").GetProperty("code").GetString());
+            StringAssert.Contains(
+                status.GetProperty("error").GetProperty("message").GetString(),
+                "playback");
+            Assert.IsTrue(captures.Microphone.IsStopped);
+            Assert.IsTrue(captures.Playback.IsStopped);
+            Assert.IsTrue(recognizers.You.IsStopped);
+            Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task NonRecoverableAzureErrorStopsSessionWithSanitizedSourceFailure()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var captures = new ControlledAudioCaptureFactory();
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(stateStore, captures, recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            recognizers.You.Fail("AuthenticationFailure");
+
+            var status = await WaitForStateAsync(application, "failed");
+            Assert.AreEqual("azure-failure", status.GetProperty("stopReason").GetString());
+            Assert.AreEqual(
+                "azure-recognition-failed",
+                status.GetProperty("error").GetProperty("code").GetString());
+            Assert.AreEqual(
+                "Azure Speech recognition failed for you (AuthenticationFailure).",
+                status.GetProperty("error").GetProperty("message").GetString());
+            Assert.IsTrue(captures.Microphone.IsStopped);
+            Assert.IsTrue(captures.Playback.IsStopped);
+            Assert.IsTrue(recognizers.You.IsStopped);
+            Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task TwoHourLimitGracefullyStopsSessionAndWritesMarker()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var captures = new ControlledAudioCaptureFactory();
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var durationReached = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            captures,
+            recognizers,
+            durationDelay: (duration, cancellationToken) =>
+            {
+                Assert.AreEqual(TimeSpan.FromHours(2), duration);
+                return durationReached.Task.WaitAsync(cancellationToken);
+            });
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            durationReached.TrySetResult();
+
+            var status = await WaitForStateAsync(application, "stopped");
+            Assert.AreEqual("duration-limit", status.GetProperty("stopReason").GetString());
+            StringAssert.Contains(
+                await File.ReadAllTextAsync(outputPath),
+                "> Transcription stopped: two-hour session limit reached.");
+            Assert.IsTrue(captures.Microphone.IsStopped);
+            Assert.IsTrue(captures.Playback.IsStopped);
+            Assert.IsTrue(recognizers.You.IsStopped);
+            Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task GracefulStopFlushesFinalizedSpeechEmittedDuringRecognizerShutdown()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        recognizers.You.Stopping += () =>
+            recognizers.You.EmitFinalized("A final in-flight thought.");
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(["stop"], new StringWriter(), new StringWriter()));
+
+            StringAssert.Contains(
+                await File.ReadAllTextAsync(outputPath),
+                "**You:** A final in-flight thought.");
         }
         finally
         {
@@ -1118,6 +1329,113 @@ public sealed class SessionCommandTests
     }
 
     [TestMethod]
+    public async Task StopTimeoutTerminatesWorkerAndRetainsTerminalStatus()
+    {
+        var request = new StartSessionRequest(
+            Path.GetFullPath("meeting.md"),
+            "microphone-1",
+            "playback-1");
+        var stateStore = new ControlledSessionStateStore();
+        await stateStore.WriteAsync(
+            SessionStateDocument.FromStatus(
+                new LiveSessionStatus(
+                    "session-1",
+                    "running",
+                    request.OutputPath,
+                    request.MicrophoneId,
+                    request.PlaybackId),
+                processId: 42),
+            CancellationToken.None);
+        var worker = new ControlledStopTimeoutWorker();
+        var application = new CliApplication(
+            new ControlledAudioDeviceDiscovery([], []),
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "unused"));
+        var stopOutput = new StringWriter();
+
+        var stopExitCode = await application.RunAsync(
+            ["stop"],
+            stopOutput,
+            new StringWriter());
+
+        Assert.AreNotEqual(0, stopExitCode);
+        Assert.IsTrue(worker.WasTerminated);
+        var statusOutput = new StringWriter();
+        Assert.AreEqual(
+            0,
+            await application.RunAsync(["status"], statusOutput, new StringWriter()));
+        using var status = JsonDocument.Parse(statusOutput.ToString());
+        Assert.AreEqual("failed", status.RootElement.GetProperty("state").GetString());
+        Assert.AreEqual(
+            "stop-timeout",
+            status.RootElement.GetProperty("stopReason").GetString());
+        Assert.AreEqual(
+            "session-stop-timeout",
+            status.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [TestMethod]
+    public async Task StaleRunningStateIsDetectedAndNextStartRecovers()
+    {
+        var staleRequest = new StartSessionRequest(
+            Path.GetFullPath("stale.md"),
+            "microphone-1",
+            "playback-1");
+        var stateStore = new ControlledSessionStateStore();
+        await stateStore.WriteAsync(
+            SessionStateDocument.FromStatus(
+                new LiveSessionStatus(
+                    "stale-session",
+                    "running",
+                    staleRequest.OutputPath,
+                    staleRequest.MicrophoneId,
+                    staleRequest.PlaybackId),
+                processId: 41),
+            CancellationToken.None);
+        var worker = new ControlledStaleWorker(stateStore);
+        var application = new CliApplication(
+            new ControlledAudioDeviceDiscovery(
+                [new AudioDevice("microphone-1", "Microphone", true)],
+                [new AudioDevice("playback-1", "Playback", true)]),
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "replacement-session"));
+        var staleOutput = new StringWriter();
+
+        Assert.AreEqual(
+            0,
+            await application.RunAsync(["status"], staleOutput, new StringWriter()));
+        using (var stale = JsonDocument.Parse(staleOutput.ToString()))
+        {
+            Assert.AreEqual("failed", stale.RootElement.GetProperty("state").GetString());
+            Assert.AreEqual(
+                "worker-failure",
+                stale.RootElement.GetProperty("stopReason").GetString());
+            Assert.AreEqual(
+                "session-worker-stale",
+                stale.RootElement.GetProperty("error").GetProperty("code").GetString());
+        }
+
+        var replacementOutput = new StringWriter();
+        Assert.AreEqual(
+            0,
+            await application.RunAsync(
+                ["start", "replacement.md"],
+                replacementOutput,
+                new StringWriter()));
+        using var replacement = JsonDocument.Parse(replacementOutput.ToString());
+        Assert.AreEqual(
+            "replacement-session",
+            replacement.RootElement.GetProperty("sessionId").GetString());
+        Assert.AreEqual(1, worker.LaunchCount);
+    }
+
+    [TestMethod]
     public async Task UnexpectedOperationalFailureStillReturnsOneJsonResult()
     {
         var application = new CliApplication(
@@ -1138,6 +1456,66 @@ public sealed class SessionCommandTests
         Assert.AreEqual(
             $"Command failed: state unavailable{Environment.NewLine}",
             standardError.ToString());
+    }
+
+    [TestMethod]
+    public async Task StartupTimeoutKillsIncompleteWorkerRetainsFailureAndAllowsRetry()
+    {
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledStartupWorker(stateStore);
+        var nextSessionNumber = 0;
+        var startupWait = TimeSpan.Zero;
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => $"session-{++nextSessionNumber}",
+                (duration, _) =>
+                {
+                    startupWait += duration;
+                    return Task.CompletedTask;
+                }));
+        var firstOutput = new StringWriter();
+
+        var firstExitCode = await application.RunAsync(
+            ["start", "first.md"],
+            firstOutput,
+            new StringWriter());
+
+        Assert.AreNotEqual(0, firstExitCode);
+        using (var failedStart = JsonDocument.Parse(firstOutput.ToString()))
+        {
+            Assert.AreEqual(
+                "session-start-timeout",
+                failedStart.RootElement.GetProperty("error").GetProperty("code").GetString());
+        }
+        Assert.IsTrue(worker.FirstWorkerWasKilled);
+        Assert.AreEqual(TimeSpan.FromSeconds(15), startupWait);
+
+        var statusOutput = new StringWriter();
+        Assert.AreEqual(
+            0,
+            await application.RunAsync(["status"], statusOutput, new StringWriter()));
+        using (var failedStatus = JsonDocument.Parse(statusOutput.ToString()))
+        {
+            Assert.AreEqual("failed", failedStatus.RootElement.GetProperty("state").GetString());
+            Assert.AreEqual(
+                "startup-failure",
+                failedStatus.RootElement.GetProperty("stopReason").GetString());
+        }
+
+        var retryOutput = new StringWriter();
+        Assert.AreEqual(
+            0,
+            await application.RunAsync(["start", "retry.md"], retryOutput, new StringWriter()));
+        using var retry = JsonDocument.Parse(retryOutput.ToString());
+        Assert.AreEqual("session-2", retry.RootElement.GetProperty("sessionId").GetString());
+        Assert.AreEqual("running", retry.RootElement.GetProperty("state").GetString());
     }
 
     private sealed class ControlledAudioDeviceDiscovery(
@@ -1203,6 +1581,8 @@ public sealed class SessionCommandTests
     {
         public event Action<ReadOnlyMemory<byte>>? AudioAvailable;
 
+        public event Action? TerminalFailure;
+
         public bool IsStopped { get; private set; }
 
         public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -1216,6 +1596,8 @@ public sealed class SessionCommandTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
         public void EmitAudio(ReadOnlyMemory<byte> audio) => AudioAvailable?.Invoke(audio);
+
+        public void Fail(string message) => TerminalFailure?.Invoke();
     }
 
     private sealed class ControlledSpeechRecognizerFactory : ISpeechRecognizerFactory
@@ -1240,11 +1622,15 @@ public sealed class SessionCommandTests
 
         public event Action? RecoverableInterruption;
 
+        public event Action<string>? TerminalFailure;
+
         public bool IsStopped { get; private set; }
 
         public event Action<ReadOnlyMemory<byte>>? AudioWritten;
 
         public event Action? ReplayCompleting;
+
+        public event Action? Stopping;
 
         public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
@@ -1264,6 +1650,8 @@ public sealed class SessionCommandTests
 
         public void Interrupt() => RecoverableInterruption?.Invoke();
 
+        public void Fail(string errorCode) => TerminalFailure?.Invoke(errorCode);
+
         public void CompleteRecovery()
         {
             recovery.TrySetResult();
@@ -1277,6 +1665,7 @@ public sealed class SessionCommandTests
 
         public Task StopAsync(CancellationToken cancellationToken)
         {
+            Stopping?.Invoke();
             IsStopped = true;
             return Task.CompletedTask;
         }
@@ -1349,11 +1738,194 @@ public sealed class SessionCommandTests
             Task.FromResult(state);
     }
 
+    private sealed class ControlledStartupWorker(ISessionStateStore stateStore) : IDetachedWorkerControl
+    {
+        private bool isActive;
+        private int launchCount;
+
+        public bool IsActive => isActive;
+
+        public bool FirstWorkerWasKilled { get; private set; }
+
+        public ValueTask<IAsyncDisposable> AcquireCommandLockAsync(
+            TimeSpan timeout,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<IAsyncDisposable>(new ControlledCommandLock());
+
+        public async Task<IWorkerProcess> LaunchAsync(
+            string sessionId,
+            StartSessionRequest request,
+            CancellationToken cancellationToken)
+        {
+            launchCount++;
+            isActive = true;
+
+            if (launchCount == 2)
+            {
+                await stateStore.WriteAsync(
+                    SessionStateDocument.FromStatus(
+                        new LiveSessionStatus(
+                            sessionId,
+                            "running",
+                            request.OutputPath,
+                            request.MicrophoneId,
+                            request.PlaybackId),
+                        processId: 43),
+                    cancellationToken);
+            }
+
+            return new ControlledWorkerProcess(
+                launchCount + 41,
+                () =>
+                {
+                    isActive = false;
+                    FirstWorkerWasKilled = true;
+                });
+        }
+
+        public Task SignalStopAsync(string sessionId, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task<bool> WaitForExitAsync(
+            int processId,
+            TimeSpan timeout,
+            CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public void Terminate(int processId)
+        {
+        }
+
+        private sealed class ControlledCommandLock : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+
+        private sealed class ControlledWorkerProcess(
+            int processId,
+            Action kill) : IWorkerProcess
+        {
+            public int ProcessId { get; } = processId;
+
+            public bool HasExited => false;
+
+            public void Kill() => kill();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
+    private sealed class ControlledStopTimeoutWorker : IDetachedWorkerControl
+    {
+        public bool IsActive => true;
+
+        public bool WasTerminated { get; private set; }
+
+        public ValueTask<IAsyncDisposable> AcquireCommandLockAsync(
+            TimeSpan timeout,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<IAsyncDisposable>(new ControlledCommandLock());
+
+        public Task<IWorkerProcess> LaunchAsync(
+            string sessionId,
+            StartSessionRequest request,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task SignalStopAsync(string sessionId, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task<bool> WaitForExitAsync(
+            int processId,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            Assert.AreEqual(TimeSpan.FromSeconds(5), timeout);
+            return Task.FromResult(false);
+        }
+
+        public void Terminate(int processId)
+        {
+            Assert.AreEqual(42, processId);
+            WasTerminated = true;
+        }
+
+        private sealed class ControlledCommandLock : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ControlledStaleWorker(ISessionStateStore stateStore) : IDetachedWorkerControl
+    {
+        private bool isActive;
+
+        public bool IsActive => isActive;
+
+        public int LaunchCount { get; private set; }
+
+        public ValueTask<IAsyncDisposable> AcquireCommandLockAsync(
+            TimeSpan timeout,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<IAsyncDisposable>(new ControlledCommandLock());
+
+        public async Task<IWorkerProcess> LaunchAsync(
+            string sessionId,
+            StartSessionRequest request,
+            CancellationToken cancellationToken)
+        {
+            LaunchCount++;
+            isActive = true;
+            await stateStore.WriteAsync(
+                SessionStateDocument.FromStatus(
+                    new LiveSessionStatus(
+                        sessionId,
+                        "running",
+                        request.OutputPath,
+                        request.MicrophoneId,
+                        request.PlaybackId),
+                    processId: 42),
+                cancellationToken);
+            return new ControlledWorkerProcess();
+        }
+
+        public Task SignalStopAsync(string sessionId, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task<bool> WaitForExitAsync(
+            int processId,
+            TimeSpan timeout,
+            CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public void Terminate(int processId) => isActive = false;
+
+        private sealed class ControlledCommandLock : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+
+        private sealed class ControlledWorkerProcess : IWorkerProcess
+        {
+            public int ProcessId => 42;
+
+            public bool HasExited => false;
+
+            public void Kill()
+            {
+            }
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
     private sealed class ControlledDetachedWorker(
         ISessionStateStore stateStore,
         IAudioCaptureFactory captures,
         ISpeechRecognizerFactory recognizers,
-        Func<CancellationToken, Task>? transcriptHoldback = null) : IDetachedWorkerControl
+        Func<CancellationToken, Task>? transcriptHoldback = null,
+        Func<TimeSpan, CancellationToken, Task>? durationDelay = null) : IDetachedWorkerControl
     {
         private InProcessLiveSessionController? session;
         private SessionStatePublisher? statePublisher;
@@ -1376,7 +1948,8 @@ public sealed class SessionCommandTests
                 captures,
                 recognizers,
                 () => launchedSessionId,
-                transcriptHoldback ?? (_ => Task.CompletedTask));
+                transcriptHoldback ?? (_ => Task.CompletedTask),
+                durationDelay: durationDelay);
             statePublisher = new SessionStatePublisher(stateStore, processId: 42);
             session.StatusChanged += status =>
                 _ = statePublisher.PublishAsync(status, CancellationToken.None);
@@ -1396,6 +1969,11 @@ public sealed class SessionCommandTests
             int processId,
             TimeSpan timeout,
             CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public void Terminate(int processId)
+        {
+            session = null;
+        }
 
         private async Task PublishReadyStateAsync(
             string launchedSessionId,
