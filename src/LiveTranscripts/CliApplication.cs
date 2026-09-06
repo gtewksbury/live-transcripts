@@ -233,6 +233,19 @@ internal sealed class CliApplication
                 status.OutputPath,
                 status.MicrophoneId,
                 status.PlaybackId,
+                Sources = new
+                {
+                    You = new
+                    {
+                        State = status.YouRecognitionState,
+                        SpeechLost = status.YouSpeechLost,
+                    },
+                    Meeting = new
+                    {
+                        State = status.MeetingRecognitionState,
+                        SpeechLost = status.MeetingSpeechLost,
+                    },
+                },
             }
             : new
             {
@@ -242,6 +255,19 @@ internal sealed class CliApplication
                 status.OutputPath,
                 status.MicrophoneId,
                 status.PlaybackId,
+                Sources = new
+                {
+                    You = new
+                    {
+                        State = status.YouRecognitionState,
+                        SpeechLost = status.YouSpeechLost,
+                    },
+                    Meeting = new
+                    {
+                        State = status.MeetingRecognitionState,
+                        SpeechLost = status.MeetingSpeechLost,
+                    },
+                },
                 Error = new
                 {
                     Code = status.ErrorCode,

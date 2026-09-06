@@ -30,9 +30,15 @@ internal interface ISpeechRecognizer : IAsyncDisposable
 {
     event Action<FinalizedRecognition>? Finalized;
 
+    event Action? RecoverableInterruption;
+
     Task StartAsync(CancellationToken cancellationToken);
 
     void WriteAudio(ReadOnlyMemory<byte> audio);
+
+    Task RecoverAsync(CancellationToken cancellationToken);
+
+    Task CompleteReplayAsync(CancellationToken cancellationToken);
 
     Task StopAsync(CancellationToken cancellationToken);
 }
@@ -53,6 +59,8 @@ internal sealed class InProcessLiveSessionController(
     private LiveTranscriptionSession? session;
     private LiveSessionStatus? status;
     private TaskCompletionSource<LiveSessionStatus>? terminalStatus;
+
+    internal event Action<LiveSessionStatus>? StatusChanged;
 
     public async Task<LiveSessionStatus> StartAsync(
         StartSessionRequest request,
@@ -76,6 +84,7 @@ internal sealed class InProcessLiveSessionController(
                 speechRecognizerFactory,
                 transcriptHoldback);
             candidate.WriteFailed += HandleWriteFailure;
+            candidate.RecognitionStateChanged += HandleRecognitionStateChanged;
             terminalStatus = new TaskCompletionSource<LiveSessionStatus>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -86,6 +95,7 @@ internal sealed class InProcessLiveSessionController(
             catch
             {
                 candidate.WriteFailed -= HandleWriteFailure;
+                candidate.RecognitionStateChanged -= HandleRecognitionStateChanged;
                 await candidate.DisposeAsync();
                 throw;
             }
@@ -97,6 +107,7 @@ internal sealed class InProcessLiveSessionController(
                 request.OutputPath,
                 request.MicrophoneId,
                 request.PlaybackId);
+            StatusChanged?.Invoke(status);
             return status;
         }
         finally
@@ -135,6 +146,7 @@ internal sealed class InProcessLiveSessionController(
             }
 
             session.WriteFailed -= HandleWriteFailure;
+            session.RecognitionStateChanged -= HandleRecognitionStateChanged;
             await session.StopAsync(cancellationToken);
             await session.DisposeAsync();
             session = null;
@@ -158,6 +170,51 @@ internal sealed class InProcessLiveSessionController(
     private void HandleWriteFailure(LiveSessionException exception) =>
         _ = TransitionToWriteFailureAsync(exception);
 
+    private void HandleRecognitionStateChanged(
+        TranscriptSource source,
+        bool degraded,
+        bool speechLost) => _ = TransitionRecognitionStateAsync(source, degraded, speechLost);
+
+    private async Task TransitionRecognitionStateAsync(
+        TranscriptSource source,
+        bool degraded,
+        bool speechLost)
+    {
+        await gate.WaitAsync(CancellationToken.None);
+
+        try
+        {
+            if (session is null || status is null)
+            {
+                return;
+            }
+
+            status = source == TranscriptSource.You
+                ? status with
+                {
+                    YouRecognitionState = degraded ? "degraded" : "running",
+                    YouSpeechLost = status.YouSpeechLost || speechLost,
+                }
+                : status with
+                {
+                    MeetingRecognitionState = degraded ? "degraded" : "running",
+                    MeetingSpeechLost = status.MeetingSpeechLost || speechLost,
+                };
+            status = status with
+            {
+                State = status.YouRecognitionState == "degraded" ||
+                    status.MeetingRecognitionState == "degraded"
+                        ? "degraded"
+                        : "running",
+            };
+            StatusChanged?.Invoke(status);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     private async Task TransitionToWriteFailureAsync(LiveSessionException exception)
     {
         await gate.WaitAsync(CancellationToken.None);
@@ -170,6 +227,7 @@ internal sealed class InProcessLiveSessionController(
             }
 
             session.WriteFailed -= HandleWriteFailure;
+            session.RecognitionStateChanged -= HandleRecognitionStateChanged;
 
             try
             {
@@ -210,6 +268,8 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     private readonly IAudioCapture playbackCapture;
     private readonly ISpeechRecognizer youRecognizer;
     private readonly ISpeechRecognizer meetingRecognizer;
+    private readonly RecoveringRecognitionStream youStream;
+    private readonly RecoveringRecognitionStream meetingStream;
     private readonly TranscriptOrderingBuffer transcriptOrdering;
     private readonly object writerGate = new();
     private int writeFailureSignaled;
@@ -225,10 +285,25 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
         playbackCapture = audioCaptureFactory.CreatePlayback(request.PlaybackId);
         youRecognizer = speechRecognizerFactory.Create(TranscriptSource.You);
         meetingRecognizer = speechRecognizerFactory.Create(TranscriptSource.Meeting);
-        transcriptOrdering = new TranscriptOrderingBuffer(WriteFinalized, transcriptHoldback);
+        transcriptOrdering = new TranscriptOrderingBuffer(
+            WriteFinalized,
+            WriteInterruptionMarker,
+            transcriptHoldback);
+        youStream = new RecoveringRecognitionStream(
+            TranscriptSource.You,
+            youRecognizer,
+            OnRecognitionStateChanged,
+            transcriptOrdering.AddInterruptionMarker);
+        meetingStream = new RecoveringRecognitionStream(
+            TranscriptSource.Meeting,
+            meetingRecognizer,
+            OnRecognitionStateChanged,
+            transcriptOrdering.AddInterruptionMarker);
     }
 
     public event Action<LiveSessionException>? WriteFailed;
+
+    public event Action<TranscriptSource, bool, bool>? RecognitionStateChanged;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -256,10 +331,10 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
             await writer.WriteAsync(heading.AsMemory(), cancellationToken);
         }
 
-        microphoneCapture.AudioAvailable += youRecognizer.WriteAudio;
-        playbackCapture.AudioAvailable += meetingRecognizer.WriteAudio;
-        youRecognizer.Finalized += WriteYou;
-        meetingRecognizer.Finalized += WriteMeeting;
+        microphoneCapture.AudioAvailable += youStream.WriteAudio;
+        playbackCapture.AudioAvailable += meetingStream.WriteAudio;
+        youStream.Finalized += WriteYou;
+        meetingStream.Finalized += WriteMeeting;
 
         await Task.WhenAll(
             youRecognizer.StartAsync(cancellationToken),
@@ -275,22 +350,40 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
             microphoneCapture.StopAsync(cancellationToken),
             playbackCapture.StopAsync(cancellationToken));
         await Task.WhenAll(
-            youRecognizer.StopAsync(cancellationToken),
-            meetingRecognizer.StopAsync(cancellationToken));
+            youStream.StopAsync(cancellationToken),
+            meetingStream.StopAsync(cancellationToken));
         await transcriptOrdering.CompleteAsync();
     }
 
     public async ValueTask DisposeAsync()
     {
-        microphoneCapture.AudioAvailable -= youRecognizer.WriteAudio;
-        playbackCapture.AudioAvailable -= meetingRecognizer.WriteAudio;
-        youRecognizer.Finalized -= WriteYou;
-        meetingRecognizer.Finalized -= WriteMeeting;
+        microphoneCapture.AudioAvailable -= youStream.WriteAudio;
+        playbackCapture.AudioAvailable -= meetingStream.WriteAudio;
+        youStream.Finalized -= WriteYou;
+        meetingStream.Finalized -= WriteMeeting;
         await microphoneCapture.DisposeAsync();
         await playbackCapture.DisposeAsync();
         await youRecognizer.DisposeAsync();
         await meetingRecognizer.DisposeAsync();
         await transcriptOrdering.CompleteAsync();
+    }
+
+    private void OnRecognitionStateChanged(
+        TranscriptSource source,
+        bool degraded,
+        bool speechLost,
+        TimeSpan audioOffset)
+    {
+        if (degraded)
+        {
+            transcriptOrdering.SuspendAfter(source, audioOffset);
+        }
+        else
+        {
+            transcriptOrdering.Resume(source);
+        }
+
+        RecognitionStateChanged?.Invoke(source, degraded, speechLost);
     }
 
     private void WriteYou(FinalizedRecognition result) =>
@@ -307,7 +400,19 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         var label = source == TranscriptSource.You ? "You" : "Meeting";
+        AppendTranscriptText($"**{label}:** {text.Trim()}{Environment.NewLine}{Environment.NewLine}");
+    }
 
+    private void WriteInterruptionMarker(TranscriptSource source)
+    {
+        var label = source == TranscriptSource.You ? "You" : "Meeting";
+        AppendTranscriptText(
+            $"> **{label}:** Transcription was interrupted and some speech may be missing." +
+            $"{Environment.NewLine}{Environment.NewLine}");
+    }
+
+    private void AppendTranscriptText(string text)
+    {
         try
         {
             lock (writerGate)
@@ -319,7 +424,7 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
 
                 File.AppendAllText(
                     request.OutputPath,
-                    $"**{label}:** {text.Trim()}{Environment.NewLine}{Environment.NewLine}",
+                    text,
                     new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             }
         }
@@ -335,13 +440,241 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     }
 }
 
+internal sealed class RecoveringRecognitionStream
+{
+    private const int BytesPerSecond = 16_000 * 2;
+    private const int MaxBufferedBytes = BytesPerSecond * 30;
+
+    private readonly TranscriptSource source;
+    private readonly ISpeechRecognizer recognizer;
+    private readonly Action<TranscriptSource, bool, bool, TimeSpan> stateChanged;
+    private readonly Action<TranscriptSource, TimeSpan> writeInterruptionMarker;
+    private readonly object gate = new();
+    private readonly Queue<byte[]> bufferedAudio = [];
+    private readonly CancellationTokenSource recoveryCancellation = new();
+    private Task recoveryTask = Task.CompletedTask;
+    private int bufferedBytes;
+    private long capturedAudioBytes;
+    private long recoveryStartBytes;
+    private long droppedAudioBytes;
+    private long recognizerOffsetBaseBytes;
+    private bool recovering;
+    private bool speechLost;
+    private bool lossDuringRecovery;
+
+    public RecoveringRecognitionStream(
+        TranscriptSource source,
+        ISpeechRecognizer recognizer,
+        Action<TranscriptSource, bool, bool, TimeSpan> stateChanged,
+        Action<TranscriptSource, TimeSpan> writeInterruptionMarker)
+    {
+        this.source = source;
+        this.recognizer = recognizer;
+        this.stateChanged = stateChanged;
+        this.writeInterruptionMarker = writeInterruptionMarker;
+        recognizer.Finalized += HandleFinalized;
+        recognizer.RecoverableInterruption += HandleRecoverableInterruption;
+    }
+
+    public event Action<FinalizedRecognition>? Finalized;
+
+    public void WriteAudio(ReadOnlyMemory<byte> audio)
+    {
+        lock (gate)
+        {
+            if (!recovering)
+            {
+                recognizer.WriteAudio(audio);
+                capturedAudioBytes += audio.Length;
+                return;
+            }
+
+            var bufferedChunk = audio.ToArray();
+            bufferedAudio.Enqueue(bufferedChunk);
+            bufferedBytes += bufferedChunk.Length;
+            capturedAudioBytes += bufferedChunk.Length;
+
+            while (bufferedBytes > MaxBufferedBytes && bufferedAudio.Count > 0)
+            {
+                var droppedBytes = bufferedAudio.Dequeue().Length;
+                bufferedBytes -= droppedBytes;
+                droppedAudioBytes += droppedBytes;
+
+                if (!lossDuringRecovery)
+                {
+                    lossDuringRecovery = true;
+                    speechLost = true;
+                    stateChanged(
+                        source,
+                        true,
+                        true,
+                        TimeSpan.FromSeconds((double)recoveryStartBytes / BytesPerSecond));
+                }
+            }
+        }
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        recoveryCancellation.Cancel();
+
+        try
+        {
+            await recoveryTask.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (recoveryCancellation.IsCancellationRequested)
+        {
+        }
+
+        await recognizer.StopAsync(cancellationToken);
+    }
+
+    private void HandleRecoverableInterruption()
+    {
+        lock (gate)
+        {
+            if (recovering)
+            {
+                return;
+            }
+
+            recovering = true;
+            recoveryStartBytes = capturedAudioBytes;
+            droppedAudioBytes = 0;
+            stateChanged(
+                source,
+                true,
+                speechLost,
+                TimeSpan.FromSeconds((double)recoveryStartBytes / BytesPerSecond));
+            recoveryTask = RecoverAsync(recoveryCancellation.Token);
+        }
+    }
+
+    private async Task RecoverAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await recognizer.RecoverAsync(cancellationToken);
+            long replayBoundaryBytes;
+            long droppedBeforeReplayBarrier;
+
+            lock (gate)
+            {
+                recognizerOffsetBaseBytes = recoveryStartBytes + droppedAudioBytes;
+
+                while (bufferedAudio.Count > 0)
+                {
+                    recognizer.WriteAudio(bufferedAudio.Dequeue());
+                }
+
+                bufferedBytes = 0;
+                replayBoundaryBytes = capturedAudioBytes;
+                droppedBeforeReplayBarrier = droppedAudioBytes;
+            }
+
+            await recognizer.CompleteReplayAsync(cancellationToken);
+            var bufferedDuringReplay = false;
+
+            lock (gate)
+            {
+                recognizerOffsetBaseBytes = replayBoundaryBytes +
+                    droppedAudioBytes -
+                    droppedBeforeReplayBarrier;
+                bufferedDuringReplay = bufferedAudio.Count > 0;
+
+                while (bufferedAudio.Count > 0)
+                {
+                    recognizer.WriteAudio(bufferedAudio.Dequeue());
+                }
+
+                bufferedBytes = 0;
+                replayBoundaryBytes = capturedAudioBytes;
+                droppedBeforeReplayBarrier = droppedAudioBytes;
+            }
+
+            if (bufferedDuringReplay)
+            {
+                await recognizer.CompleteReplayAsync(cancellationToken);
+            }
+
+            lock (gate)
+            {
+                recognizerOffsetBaseBytes = replayBoundaryBytes +
+                    droppedAudioBytes -
+                    droppedBeforeReplayBarrier;
+                var writeMarker = lossDuringRecovery;
+                lossDuringRecovery = false;
+
+                if (writeMarker)
+                {
+                    writeInterruptionMarker(
+                        source,
+                        TimeSpan.FromSeconds((double)recognizerOffsetBaseBytes / BytesPerSecond));
+                }
+
+                while (bufferedAudio.Count > 0)
+                {
+                    recognizer.WriteAudio(bufferedAudio.Dequeue());
+                }
+
+                bufferedBytes = 0;
+                recovering = false;
+                stateChanged(
+                    source,
+                    false,
+                    speechLost,
+                    TimeSpan.FromSeconds((double)capturedAudioBytes / BytesPerSecond));
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            lock (gate)
+            {
+                var bufferedSpeechLost = bufferedAudio.Count > 0;
+                bufferedAudio.Clear();
+                bufferedBytes = 0;
+                recovering = false;
+                speechLost |= bufferedSpeechLost;
+
+                if (bufferedSpeechLost && !lossDuringRecovery)
+                {
+                    writeInterruptionMarker(
+                        source,
+                        TimeSpan.FromSeconds((double)capturedAudioBytes / BytesPerSecond));
+                }
+
+                lossDuringRecovery = false;
+                stateChanged(
+                    source,
+                    false,
+                    speechLost,
+                    TimeSpan.FromSeconds((double)capturedAudioBytes / BytesPerSecond));
+            }
+        }
+    }
+
+    private void HandleFinalized(FinalizedRecognition result)
+    {
+        lock (gate)
+        {
+            Finalized?.Invoke(result with
+            {
+                AudioOffset = result.AudioOffset + TimeSpan.FromSeconds(
+                    (double)recognizerOffsetBaseBytes / BytesPerSecond),
+            });
+        }
+    }
+}
+
 internal sealed class TranscriptOrderingBuffer
 {
     private static readonly TimeSpan Holdback = TimeSpan.FromMilliseconds(500);
     private readonly object gate = new();
     private readonly List<PendingTranscriptParagraph> pending = [];
+    private readonly Dictionary<TranscriptSource, TimeSpan> suspendedAfter = [];
     private readonly CancellationTokenSource holdbackCancellation = new();
     private readonly Action<TranscriptSource, string> emit;
+    private readonly Action<TranscriptSource> emitInterruptionMarker;
     private readonly Func<CancellationToken, Task> waitForHoldback;
     private readonly HashSet<Task> holdbackTasks = [];
     private bool completed;
@@ -349,9 +682,11 @@ internal sealed class TranscriptOrderingBuffer
 
     public TranscriptOrderingBuffer(
         Action<TranscriptSource, string> emit,
+        Action<TranscriptSource> emitInterruptionMarker,
         Func<CancellationToken, Task>? waitForHoldback = null)
     {
         this.emit = emit;
+        this.emitInterruptionMarker = emitInterruptionMarker;
         this.waitForHoldback = waitForHoldback ??
             (cancellationToken => Task.Delay(Holdback, cancellationToken));
     }
@@ -376,6 +711,42 @@ internal sealed class TranscriptOrderingBuffer
                 result.AudioOffset,
                 Interlocked.Increment(ref nextSequence)));
             TrackHoldback(ReleaseAfterHoldbackAsync(pending[^1]));
+        }
+    }
+
+    public void AddInterruptionMarker(TranscriptSource source, TimeSpan audioOffset)
+    {
+        lock (gate)
+        {
+            if (completed)
+            {
+                return;
+            }
+
+            pending.Add(new PendingTranscriptParagraph(
+                source,
+                null,
+                audioOffset,
+                Interlocked.Increment(ref nextSequence)));
+            TrackHoldback(ReleaseAfterHoldbackAsync(pending[^1]));
+        }
+    }
+
+    public void SuspendAfter(TranscriptSource source, TimeSpan audioOffset)
+    {
+        lock (gate)
+        {
+            suspendedAfter.TryAdd(source, audioOffset);
+        }
+    }
+
+    public void Resume(TranscriptSource source)
+    {
+        lock (gate)
+        {
+            suspendedAfter.Remove(source);
+            pending.Sort(PendingTranscriptParagraphComparer.Instance);
+            EmitEligible();
         }
     }
 
@@ -444,11 +815,29 @@ internal sealed class TranscriptOrderingBuffer
         {
             paragraph.IsEligible = true;
             pending.Sort(PendingTranscriptParagraphComparer.Instance);
+            EmitEligible();
+        }
+    }
 
-            while (pending.Count > 0 && pending[0].IsEligible)
+    private void EmitEligible()
+    {
+        var emissionBoundary = suspendedAfter.Count == 0
+            ? TimeSpan.MaxValue
+            : suspendedAfter.Values.Min();
+
+        while (pending.Count > 0 &&
+            pending[0].IsEligible &&
+            pending[0].AudioOffset <= emissionBoundary)
+        {
+            var next = pending[0];
+            pending.RemoveAt(0);
+
+            if (next.Text is null)
             {
-                var next = pending[0];
-                pending.RemoveAt(0);
+                emitInterruptionMarker(next.Source);
+            }
+            else
+            {
                 emit(next.Source, next.Text);
             }
         }
@@ -456,13 +845,13 @@ internal sealed class TranscriptOrderingBuffer
 
     private sealed class PendingTranscriptParagraph(
         TranscriptSource source,
-        string text,
+        string? text,
         TimeSpan audioOffset,
         long sequence)
     {
         public TranscriptSource Source { get; } = source;
 
-        public string Text { get; } = text;
+        public string? Text { get; } = text;
 
         public TimeSpan AudioOffset { get; } = audioOffset;
 

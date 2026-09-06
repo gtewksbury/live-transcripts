@@ -200,9 +200,12 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
         audioConfig = AudioConfig.FromStreamInput(audioStream);
         recognizer = new SpeechRecognizer(speechConfig, audioConfig);
         recognizer.Recognized += OnRecognized;
+        recognizer.Canceled += OnCanceled;
     }
 
     public event Action<FinalizedRecognition>? Finalized;
+
+    public event Action? RecoverableInterruption;
 
     public Task StartAsync(CancellationToken cancellationToken) =>
         recognizer.StartContinuousRecognitionAsync().WaitAsync(cancellationToken);
@@ -213,16 +216,44 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
         audioStream.Write(buffer, buffer.Length);
     }
 
+    public async Task RecoverAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await recognizer.StopContinuousRecognitionAsync().WaitAsync(cancellationToken);
+        }
+        catch
+        {
+        }
+
+        await recognizer.StartContinuousRecognitionAsync().WaitAsync(cancellationToken);
+    }
+
+    public async Task CompleteReplayAsync(CancellationToken cancellationToken)
+    {
+        await recognizer.StopContinuousRecognitionAsync().WaitAsync(cancellationToken);
+        await recognizer.StartContinuousRecognitionAsync().WaitAsync(cancellationToken);
+    }
+
     public Task StopAsync(CancellationToken cancellationToken) =>
         recognizer.StopContinuousRecognitionAsync().WaitAsync(cancellationToken);
 
     public ValueTask DisposeAsync()
     {
         recognizer.Recognized -= OnRecognized;
+        recognizer.Canceled -= OnCanceled;
         recognizer.Dispose();
         audioConfig.Dispose();
         audioStream.Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    private void OnCanceled(object? sender, SpeechRecognitionCanceledEventArgs eventArgs)
+    {
+        if (eventArgs.Reason == CancellationReason.Error)
+        {
+            RecoverableInterruption?.Invoke();
+        }
     }
 
     private void OnRecognized(object? sender, SpeechRecognitionEventArgs eventArgs)

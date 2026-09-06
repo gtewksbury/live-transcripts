@@ -13,7 +13,11 @@ internal sealed record LiveSessionStatus(
     string MicrophoneId,
     string PlaybackId,
     string? ErrorCode = null,
-    string? ErrorMessage = null);
+    string? ErrorMessage = null,
+    string YouRecognitionState = "running",
+    string MeetingRecognitionState = "running",
+    bool YouSpeechLost = false,
+    bool MeetingSpeechLost = false);
 
 internal interface ILiveSessionController
 {

@@ -77,7 +77,7 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
             cancellationToken.ThrowIfCancellationRequested();
             var state = await stateStore.ReadAsync(cancellationToken);
 
-            if (state?.SessionId == sessionId && state.State == "running")
+            if (state?.SessionId == sessionId && state.State is "running" or "degraded")
             {
                 return state.ToStatus();
             }
@@ -119,7 +119,7 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
     {
         var state = await stateStore.ReadAsync(cancellationToken);
 
-        if (!Matches(state, sessionId) || state!.State != "running")
+        if (!Matches(state, sessionId) || state!.State is not ("running" or "degraded"))
         {
             return null;
         }
@@ -314,6 +314,7 @@ internal static class ProductionSessionWorker
         }
 
         var stateStore = new SessionStateStore();
+        var statePublisher = new SessionStatePublisher(stateStore, Environment.ProcessId);
         FileStream activeLock;
 
         try
@@ -342,10 +343,9 @@ internal static class ProductionSessionWorker
                 new WindowsAudioCaptureFactory(),
                 new AzureSpeechRecognizerFactory(),
                 () => sessionId);
+            controller.StatusChanged += changedStatus =>
+                _ = statePublisher.PublishAsync(changedStatus, CancellationToken.None);
             var status = await controller.StartAsync(request, CancellationToken.None);
-            await stateStore.WriteAsync(
-                SessionStateDocument.FromStatus(status, Environment.ProcessId),
-                CancellationToken.None);
 
             var stopTask = Task.Run(stopEvent.WaitOne);
             var terminalStatusTask = controller.WaitForTerminalStatusAsync(CancellationToken.None);
@@ -354,18 +354,14 @@ internal static class ProductionSessionWorker
             if (completedTask == terminalStatusTask)
             {
                 status = await terminalStatusTask;
-                await stateStore.WriteAsync(
-                    SessionStateDocument.FromStatus(status, Environment.ProcessId),
-                    CancellationToken.None);
+                await statePublisher.PublishAsync(status, CancellationToken.None);
                 stopEvent.Set();
                 await stopTask;
                 return 3;
             }
 
             status = await controller.StopAsync(sessionId, CancellationToken.None) ?? status;
-            await stateStore.WriteAsync(
-                SessionStateDocument.FromStatus(status, Environment.ProcessId),
-                CancellationToken.None);
+            await statePublisher.PublishAsync(status, CancellationToken.None);
             return 0;
         }
         catch (Exception exception)
@@ -381,7 +377,7 @@ internal static class ProductionSessionWorker
                 }
             }
 
-            await stateStore.WriteAsync(
+            await statePublisher.PublishAsync(
                 SessionStateDocument.Failed(
                     sessionId,
                     request,
@@ -427,6 +423,33 @@ internal static class ProductionSessionWorker
     }
 }
 
+internal sealed class SessionStatePublisher(ISessionStateStore stateStore, int processId)
+{
+    private readonly object gate = new();
+    private Task pendingWrite = Task.CompletedTask;
+
+    public Task PublishAsync(LiveSessionStatus status, CancellationToken cancellationToken)
+        => PublishAsync(SessionStateDocument.FromStatus(status, processId), cancellationToken);
+
+    public Task PublishAsync(SessionStateDocument state, CancellationToken cancellationToken)
+    {
+        lock (gate)
+        {
+            pendingWrite = PublishAfterAsync(pendingWrite, state, cancellationToken);
+            return pendingWrite;
+        }
+    }
+
+    private async Task PublishAfterAsync(
+        Task previousWrite,
+        SessionStateDocument state,
+        CancellationToken cancellationToken)
+    {
+        await previousWrite;
+        await stateStore.WriteAsync(state, cancellationToken);
+    }
+}
+
 internal sealed record SessionStateDocument(
     string SessionId,
     string State,
@@ -435,7 +458,11 @@ internal sealed record SessionStateDocument(
     string PlaybackId,
     int ProcessId,
     string? ErrorCode,
-    string? Error)
+    string? Error,
+    string YouRecognitionState = "running",
+    string MeetingRecognitionState = "running",
+    bool YouSpeechLost = false,
+    bool MeetingSpeechLost = false)
 {
     public static SessionStateDocument Starting(string sessionId, StartSessionRequest request) =>
         new(sessionId, "starting", request.OutputPath, request.MicrophoneId, request.PlaybackId, 0, null, null);
@@ -449,7 +476,11 @@ internal sealed record SessionStateDocument(
             status.PlaybackId,
             processId,
             status.ErrorCode,
-            status.ErrorMessage);
+            status.ErrorMessage,
+            status.YouRecognitionState,
+            status.MeetingRecognitionState,
+            status.YouSpeechLost,
+            status.MeetingSpeechLost);
 
     public static SessionStateDocument Failed(
         string sessionId,
@@ -466,7 +497,18 @@ internal sealed record SessionStateDocument(
             error);
 
     public LiveSessionStatus ToStatus() =>
-        new(SessionId, State, OutputPath, MicrophoneId, PlaybackId, ErrorCode, Error);
+        new(
+            SessionId,
+            State,
+            OutputPath,
+            MicrophoneId,
+            PlaybackId,
+            ErrorCode,
+            Error,
+            YouRecognitionState,
+            MeetingRecognitionState,
+            YouSpeechLost,
+            MeetingSpeechLost);
 }
 
 internal sealed class SessionStateStore : ISessionStateStore
