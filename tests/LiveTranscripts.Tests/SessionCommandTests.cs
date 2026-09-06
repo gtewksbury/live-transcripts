@@ -210,6 +210,69 @@ public sealed class SessionCommandTests
     }
 
     [TestMethod]
+    public async Task SessionOrdersFinalizedSpeechByAudioOffsetInsteadOfCallbackOrder()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var holdback = new ControlledTranscriptHoldback();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            recognizers,
+            holdback.WaitAsync);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            recognizers.You.EmitFinalized("This is damn important.", TimeSpan.FromSeconds(2));
+            recognizers.Meeting.EmitFinalized("What do you think?", TimeSpan.FromSeconds(1));
+
+            Assert.AreEqual(
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}",
+                await File.ReadAllTextAsync(outputPath));
+            holdback.ReleaseNext();
+            Assert.AreEqual(
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}",
+                await File.ReadAllTextAsync(outputPath));
+            holdback.ReleaseNext();
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["stop"],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            var expectedTranscript =
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}" +
+                $"**Meeting:** What do you think?{Environment.NewLine}{Environment.NewLine}" +
+                $"**You:** This is damn important.{Environment.NewLine}{Environment.NewLine}";
+            Assert.AreEqual(expectedTranscript, await File.ReadAllTextAsync(outputPath));
+        }
+        finally
+        {
+            await application.RunAsync(["stop"], new StringWriter(), new StringWriter());
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
     public async Task StartRefusesExistingDestinationWithoutLeavingWorkerActive()
     {
         var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
@@ -429,12 +492,13 @@ public sealed class SessionCommandTests
 
             recognizers.Meeting.EmitFinalized("The café is open.");
 
+            var expectedTranscript =
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}" +
+                $"**Meeting:** The café is open.{Environment.NewLine}{Environment.NewLine}";
             using var visibleBytes = new MemoryStream();
             await concurrentReader.CopyToAsync(visibleBytes);
             CollectionAssert.AreEqual(
-                System.Text.Encoding.UTF8.GetBytes(
-                    $"# Live Transcript{Environment.NewLine}{Environment.NewLine}" +
-                    $"**Meeting:** The café is open.{Environment.NewLine}{Environment.NewLine}"),
+                System.Text.Encoding.UTF8.GetBytes(expectedTranscript),
                 visibleBytes.ToArray());
             var status = await WaitForStateAsync(application, "running");
             Assert.AreEqual("session-1", status.GetProperty("sessionId").GetString());
@@ -697,7 +761,7 @@ public sealed class SessionCommandTests
 
     private sealed class ControlledSpeechRecognizer : ISpeechRecognizer
     {
-        public event Action<string>? Finalized;
+        public event Action<FinalizedRecognition>? Finalized;
 
         public bool IsStopped { get; private set; }
 
@@ -707,7 +771,10 @@ public sealed class SessionCommandTests
         {
         }
 
-        public void EmitFinalized(string text) => Finalized?.Invoke(text);
+        public void EmitFinalized(string text) => EmitFinalized(text, TimeSpan.Zero);
+
+        public void EmitFinalized(string text, TimeSpan audioOffset) =>
+            Finalized?.Invoke(new FinalizedRecognition(text, audioOffset));
 
         public Task StopAsync(CancellationToken cancellationToken)
         {
@@ -758,7 +825,8 @@ public sealed class SessionCommandTests
     private sealed class ControlledDetachedWorker(
         ISessionStateStore stateStore,
         IAudioCaptureFactory captures,
-        ISpeechRecognizerFactory recognizers) : IDetachedWorkerControl
+        ISpeechRecognizerFactory recognizers,
+        Func<CancellationToken, Task>? transcriptHoldback = null) : IDetachedWorkerControl
     {
         private InProcessLiveSessionController? session;
         private Task? startup;
@@ -776,7 +844,11 @@ public sealed class SessionCommandTests
             StartSessionRequest launchedRequest,
             CancellationToken cancellationToken)
         {
-            session = new InProcessLiveSessionController(captures, recognizers, () => launchedSessionId);
+            session = new InProcessLiveSessionController(
+                captures,
+                recognizers,
+                () => launchedSessionId,
+                transcriptHoldback ?? (_ => Task.CompletedTask));
             startup = PublishReadyStateAsync(launchedSessionId, launchedRequest, cancellationToken);
             return Task.FromResult<IWorkerProcess>(new ControlledWorkerProcess(42));
         }
@@ -854,6 +926,20 @@ public sealed class SessionCommandTests
             {
             }
         }
+    }
+
+    private sealed class ControlledTranscriptHoldback
+    {
+        private readonly Queue<TaskCompletionSource> pending = new();
+
+        public Task WaitAsync(CancellationToken cancellationToken)
+        {
+            var release = new TaskCompletionSource();
+            pending.Enqueue(release);
+            return release.Task.WaitAsync(cancellationToken);
+        }
+
+        public void ReleaseNext() => pending.Dequeue().TrySetResult();
     }
 
     private sealed class FailingStopSessionController : ILiveSessionController

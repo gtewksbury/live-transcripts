@@ -202,7 +202,7 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
         recognizer.Recognized += OnRecognized;
     }
 
-    public event Action<string>? Finalized;
+    public event Action<FinalizedRecognition>? Finalized;
 
     public Task StartAsync(CancellationToken cancellationToken) =>
         recognizer.StartContinuousRecognitionAsync().WaitAsync(cancellationToken);
@@ -230,7 +230,9 @@ internal sealed class AzureSpeechRecognizer : ISpeechRecognizer
         if (eventArgs.Result.Reason == ResultReason.RecognizedSpeech &&
             !string.IsNullOrWhiteSpace(eventArgs.Result.Text))
         {
-            Finalized?.Invoke(eventArgs.Result.Text);
+            Finalized?.Invoke(new FinalizedRecognition(
+                eventArgs.Result.Text,
+                TimeSpan.FromTicks(checked((long)eventArgs.Result.OffsetInTicks))));
         }
     }
 }

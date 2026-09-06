@@ -8,6 +8,8 @@ internal enum TranscriptSource
     Meeting,
 }
 
+internal sealed record FinalizedRecognition(string Text, TimeSpan AudioOffset);
+
 internal interface IAudioCapture : IAsyncDisposable
 {
     event Action<ReadOnlyMemory<byte>>? AudioAvailable;
@@ -26,7 +28,7 @@ internal interface IAudioCaptureFactory
 
 internal interface ISpeechRecognizer : IAsyncDisposable
 {
-    event Action<string>? Finalized;
+    event Action<FinalizedRecognition>? Finalized;
 
     Task StartAsync(CancellationToken cancellationToken);
 
@@ -43,7 +45,8 @@ internal interface ISpeechRecognizerFactory
 internal sealed class InProcessLiveSessionController(
     IAudioCaptureFactory audioCaptureFactory,
     ISpeechRecognizerFactory speechRecognizerFactory,
-    Func<string>? sessionIdFactory = null) : ILiveSessionController
+    Func<string>? sessionIdFactory = null,
+    Func<CancellationToken, Task>? transcriptHoldback = null) : ILiveSessionController
 {
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly Func<string> createSessionId = sessionIdFactory ?? (() => Guid.NewGuid().ToString("N"));
@@ -70,7 +73,8 @@ internal sealed class InProcessLiveSessionController(
             var candidate = new LiveTranscriptionSession(
                 request,
                 audioCaptureFactory,
-                speechRecognizerFactory);
+                speechRecognizerFactory,
+                transcriptHoldback);
             candidate.WriteFailed += HandleWriteFailure;
             terminalStatus = new TaskCompletionSource<LiveSessionStatus>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
@@ -206,19 +210,22 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     private readonly IAudioCapture playbackCapture;
     private readonly ISpeechRecognizer youRecognizer;
     private readonly ISpeechRecognizer meetingRecognizer;
+    private readonly TranscriptOrderingBuffer transcriptOrdering;
     private readonly object writerGate = new();
     private int writeFailureSignaled;
 
     public LiveTranscriptionSession(
         StartSessionRequest request,
         IAudioCaptureFactory audioCaptureFactory,
-        ISpeechRecognizerFactory speechRecognizerFactory)
+        ISpeechRecognizerFactory speechRecognizerFactory,
+        Func<CancellationToken, Task>? transcriptHoldback = null)
     {
         this.request = request;
         microphoneCapture = audioCaptureFactory.CreateMicrophone(request.MicrophoneId);
         playbackCapture = audioCaptureFactory.CreatePlayback(request.PlaybackId);
         youRecognizer = speechRecognizerFactory.Create(TranscriptSource.You);
         meetingRecognizer = speechRecognizerFactory.Create(TranscriptSource.Meeting);
+        transcriptOrdering = new TranscriptOrderingBuffer(WriteFinalized, transcriptHoldback);
     }
 
     public event Action<LiveSessionException>? WriteFailed;
@@ -270,6 +277,7 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
         await Task.WhenAll(
             youRecognizer.StopAsync(cancellationToken),
             meetingRecognizer.StopAsync(cancellationToken));
+        await transcriptOrdering.CompleteAsync();
     }
 
     public async ValueTask DisposeAsync()
@@ -282,18 +290,23 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
         await playbackCapture.DisposeAsync();
         await youRecognizer.DisposeAsync();
         await meetingRecognizer.DisposeAsync();
+        await transcriptOrdering.CompleteAsync();
     }
 
-    private void WriteYou(string text) => WriteFinalized("You", text);
+    private void WriteYou(FinalizedRecognition result) =>
+        transcriptOrdering.Add(TranscriptSource.You, result);
 
-    private void WriteMeeting(string text) => WriteFinalized("Meeting", text);
+    private void WriteMeeting(FinalizedRecognition result) =>
+        transcriptOrdering.Add(TranscriptSource.Meeting, result);
 
-    private void WriteFinalized(string label, string text)
+    private void WriteFinalized(TranscriptSource source, string text)
     {
         if (string.IsNullOrWhiteSpace(text) || Volatile.Read(ref writeFailureSignaled) != 0)
         {
             return;
         }
+
+        var label = source == TranscriptSource.You ? "You" : "Meeting";
 
         try
         {
@@ -318,6 +331,178 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
                     "transcript-write-failed",
                     $"The transcript could not be written: {exception.Message}"));
             }
+        }
+    }
+}
+
+internal sealed class TranscriptOrderingBuffer
+{
+    private static readonly TimeSpan Holdback = TimeSpan.FromMilliseconds(500);
+    private readonly object gate = new();
+    private readonly List<PendingTranscriptParagraph> pending = [];
+    private readonly CancellationTokenSource holdbackCancellation = new();
+    private readonly Action<TranscriptSource, string> emit;
+    private readonly Func<CancellationToken, Task> waitForHoldback;
+    private readonly HashSet<Task> holdbackTasks = [];
+    private bool completed;
+    private long nextSequence;
+
+    public TranscriptOrderingBuffer(
+        Action<TranscriptSource, string> emit,
+        Func<CancellationToken, Task>? waitForHoldback = null)
+    {
+        this.emit = emit;
+        this.waitForHoldback = waitForHoldback ??
+            (cancellationToken => Task.Delay(Holdback, cancellationToken));
+    }
+
+    public void Add(TranscriptSource source, FinalizedRecognition result)
+    {
+        if (string.IsNullOrWhiteSpace(result.Text))
+        {
+            return;
+        }
+
+        lock (gate)
+        {
+            if (completed)
+            {
+                return;
+            }
+
+            pending.Add(new PendingTranscriptParagraph(
+                source,
+                result.Text,
+                result.AudioOffset,
+                Interlocked.Increment(ref nextSequence)));
+            TrackHoldback(ReleaseAfterHoldbackAsync(pending[^1]));
+        }
+    }
+
+    public async Task CompleteAsync()
+    {
+        Task completion;
+        var disposeCancellation = false;
+
+        lock (gate)
+        {
+            if (!completed)
+            {
+                completed = true;
+                holdbackCancellation.Cancel();
+                disposeCancellation = true;
+            }
+
+            completion = Task.WhenAll(holdbackTasks);
+        }
+
+        try
+        {
+            await completion;
+        }
+        finally
+        {
+            if (disposeCancellation)
+            {
+                holdbackCancellation.Dispose();
+            }
+        }
+    }
+
+    private void TrackHoldback(Task holdbackTask)
+    {
+        if (holdbackTask.IsCompleted)
+        {
+            return;
+        }
+
+        holdbackTasks.Add(holdbackTask);
+        _ = holdbackTask.ContinueWith(
+            completedTask =>
+            {
+                lock (gate)
+                {
+                    holdbackTasks.Remove(completedTask);
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task ReleaseAfterHoldbackAsync(PendingTranscriptParagraph paragraph)
+    {
+        try
+        {
+            await waitForHoldback(holdbackCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (holdbackCancellation.IsCancellationRequested)
+        {
+        }
+
+        lock (gate)
+        {
+            paragraph.IsEligible = true;
+            pending.Sort(PendingTranscriptParagraphComparer.Instance);
+
+            while (pending.Count > 0 && pending[0].IsEligible)
+            {
+                var next = pending[0];
+                pending.RemoveAt(0);
+                emit(next.Source, next.Text);
+            }
+        }
+    }
+
+    private sealed class PendingTranscriptParagraph(
+        TranscriptSource source,
+        string text,
+        TimeSpan audioOffset,
+        long sequence)
+    {
+        public TranscriptSource Source { get; } = source;
+
+        public string Text { get; } = text;
+
+        public TimeSpan AudioOffset { get; } = audioOffset;
+
+        public long Sequence { get; } = sequence;
+
+        public bool IsEligible { get; set; }
+    }
+
+    private sealed class PendingTranscriptParagraphComparer : IComparer<PendingTranscriptParagraph>
+    {
+        public static PendingTranscriptParagraphComparer Instance { get; } = new();
+
+        public int Compare(PendingTranscriptParagraph? left, PendingTranscriptParagraph? right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+
+            if (left is null)
+            {
+                return -1;
+            }
+
+            if (right is null)
+            {
+                return 1;
+            }
+
+            var offsetComparison = left.AudioOffset.CompareTo(right.AudioOffset);
+
+            if (offsetComparison != 0)
+            {
+                return offsetComparison;
+            }
+
+            var sourceComparison = left.Source.CompareTo(right.Source);
+            return sourceComparison != 0
+                ? sourceComparison
+                : left.Sequence.CompareTo(right.Sequence);
         }
     }
 }
