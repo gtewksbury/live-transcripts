@@ -210,6 +210,293 @@ public sealed class SessionCommandTests
     }
 
     [TestMethod]
+    public async Task StartRefusesExistingDestinationWithoutLeavingWorkerActive()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var existingBytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x65, 0x78, 0x69, 0x73, 0x74, 0x69, 0x6E, 0x67 };
+        await File.WriteAllBytesAsync(outputPath, existingBytes);
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            new ControlledSpeechRecognizerFactory());
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            var standardOutput = new StringWriter();
+
+            var exitCode = await application.RunAsync(
+                ["start", outputPath],
+                standardOutput,
+                new StringWriter());
+
+            Assert.AreNotEqual(0, exitCode);
+            using var result = JsonDocument.Parse(standardOutput.ToString());
+            Assert.AreEqual(
+                "transcript-already-exists",
+                result.RootElement.GetProperty("error").GetProperty("code").GetString());
+            CollectionAssert.AreEqual(existingBytes, await File.ReadAllBytesAsync(outputPath));
+            Assert.IsFalse(worker.IsActive);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task StartResolvesCallerRelativePathAndCreatesParentDirectories()
+    {
+        var rootPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}");
+        var outputPath = Path.Combine(rootPath, "nested", "meeting.md");
+        var relativeOutputPath = Path.GetRelativePath(Environment.CurrentDirectory, outputPath);
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            new ControlledSpeechRecognizerFactory());
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            var standardOutput = new StringWriter();
+
+            var exitCode = await application.RunAsync(
+                ["start", relativeOutputPath],
+                standardOutput,
+                new StringWriter());
+
+            Assert.AreEqual(0, exitCode);
+            using var result = JsonDocument.Parse(standardOutput.ToString());
+            Assert.AreEqual(outputPath, result.RootElement.GetProperty("outputPath").GetString());
+            Assert.AreEqual(
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}",
+                await File.ReadAllTextAsync(outputPath));
+        }
+        finally
+        {
+            await application.RunAsync(["stop"], new StringWriter(), new StringWriter());
+            if (Directory.Exists(rootPath))
+            {
+                Directory.Delete(rootPath, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task AppendPreservesExistingBytesAndStartsNewTranscriptSection()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var existingBytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x50, 0x72, 0x69, 0x6F, 0x72 };
+        await File.WriteAllBytesAsync(outputPath, existingBytes);
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            new ControlledSpeechRecognizerFactory());
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            var exitCode = await application.RunAsync(
+                ["start", outputPath, "--append"],
+                new StringWriter(),
+                new StringWriter());
+
+            Assert.AreEqual(0, exitCode);
+            var actualBytes = await File.ReadAllBytesAsync(outputPath);
+            var expectedSuffix = System.Text.Encoding.UTF8.GetBytes(
+                $"{Environment.NewLine}{Environment.NewLine}---{Environment.NewLine}{Environment.NewLine}" +
+                $"# Live Transcript{Environment.NewLine}{Environment.NewLine}");
+            CollectionAssert.AreEqual(existingBytes.Concat(expectedSuffix).ToArray(), actualBytes);
+        }
+        finally
+        {
+            await application.RunAsync(["stop"], new StringWriter(), new StringWriter());
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task DeletedDestinationStopsCaptureAndRetainsTerminalWriteFailure()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var captures = new ControlledAudioCaptureFactory();
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(stateStore, captures, recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+
+            File.Delete(outputPath);
+            recognizers.You.EmitFinalized("This cannot be persisted.");
+
+            var status = await WaitForStateAsync(application, "failed");
+            Assert.AreEqual(
+                "transcript-write-failed",
+                status.GetProperty("error").GetProperty("code").GetString());
+            Assert.IsFalse(File.Exists(outputPath));
+            Assert.IsTrue(captures.Microphone.IsStopped);
+            Assert.IsTrue(captures.Playback.IsStopped);
+            Assert.IsTrue(recognizers.You.IsStopped);
+            Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task FinalizedUtteranceIsUtf8AndVisibleToConcurrentReaderBeforeStop()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(
+            stateStore,
+            new ControlledAudioCaptureFactory(),
+            recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+            await using var concurrentReader = new FileStream(
+                outputPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite);
+
+            recognizers.Meeting.EmitFinalized("The café is open.");
+
+            using var visibleBytes = new MemoryStream();
+            await concurrentReader.CopyToAsync(visibleBytes);
+            CollectionAssert.AreEqual(
+                System.Text.Encoding.UTF8.GetBytes(
+                    $"# Live Transcript{Environment.NewLine}{Environment.NewLine}" +
+                    $"**Meeting:** The café is open.{Environment.NewLine}{Environment.NewLine}"),
+                visibleBytes.ToArray());
+            var status = await WaitForStateAsync(application, "running");
+            Assert.AreEqual("session-1", status.GetProperty("sessionId").GetString());
+        }
+        finally
+        {
+            await application.RunAsync(["stop"], new StringWriter(), new StringWriter());
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
+    public async Task LossOfWriteAccessStopsCaptureAndRetainsTerminalWriteFailure()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
+        var discovery = new ControlledAudioDeviceDiscovery(
+            [new AudioDevice("microphone-1", "Microphone", true)],
+            [new AudioDevice("playback-1", "Playback", true)]);
+        var captures = new ControlledAudioCaptureFactory();
+        var recognizers = new ControlledSpeechRecognizerFactory();
+        var stateStore = new ControlledSessionStateStore();
+        var worker = new ControlledDetachedWorker(stateStore, captures, recognizers);
+        var application = new CliApplication(
+            discovery,
+            new DetachedLiveSessionController(
+                stateStore,
+                worker,
+                TimeProvider.System,
+                () => "session-1"));
+
+        try
+        {
+            Assert.AreEqual(
+                0,
+                await application.RunAsync(
+                    ["start", outputPath],
+                    new StringWriter(),
+                    new StringWriter()));
+            await using var writeBlocker = new FileStream(
+                outputPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+
+            recognizers.Meeting.EmitFinalized("This write is blocked.");
+
+            var status = await WaitForStateAsync(application, "failed");
+            Assert.AreEqual(
+                "transcript-write-failed",
+                status.GetProperty("error").GetProperty("code").GetString());
+            Assert.IsTrue(captures.Microphone.IsStopped);
+            Assert.IsTrue(captures.Playback.IsStopped);
+            Assert.IsTrue(recognizers.You.IsStopped);
+            Assert.IsTrue(recognizers.Meeting.IsStopped);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
     public async Task SecondStartFailsAsJsonWhileFirstSessionRemainsActive()
     {
         var firstOutputPath = Path.Combine(Path.GetTempPath(), $"transcript-{Guid.NewGuid():N}.md");
@@ -379,9 +666,15 @@ public sealed class SessionCommandTests
     {
         public event Action<ReadOnlyMemory<byte>>? AudioAvailable;
 
+        public bool IsStopped { get; private set; }
+
         public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            IsStopped = true;
+            return Task.CompletedTask;
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -406,6 +699,8 @@ public sealed class SessionCommandTests
     {
         public event Action<string>? Finalized;
 
+        public bool IsStopped { get; private set; }
+
         public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
         public void WriteAudio(ReadOnlyMemory<byte> audio)
@@ -414,9 +709,36 @@ public sealed class SessionCommandTests
 
         public void EmitFinalized(string text) => Finalized?.Invoke(text);
 
-        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            IsStopped = true;
+            return Task.CompletedTask;
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private static async Task<JsonElement> WaitForStateAsync(
+        CliApplication application,
+        string expectedState)
+    {
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            var standardOutput = new StringWriter();
+            await application.RunAsync(["status"], standardOutput, new StringWriter());
+            using var result = JsonDocument.Parse(standardOutput.ToString());
+            var root = result.RootElement;
+
+            if (root.TryGetProperty("state", out var state) && state.GetString() == expectedState)
+            {
+                return root.Clone();
+            }
+
+            await Task.Delay(10);
+        }
+
+        Assert.Fail($"Session did not reach the '{expectedState}' state.");
+        return default;
     }
 
     private sealed class ControlledSessionStateStore : ISessionStateStore
@@ -440,6 +762,7 @@ public sealed class SessionCommandTests
     {
         private InProcessLiveSessionController? session;
         private Task? startup;
+        private Task? terminalState;
 
         public bool IsActive => session is not null;
 
@@ -484,13 +807,32 @@ public sealed class SessionCommandTests
                 await stateStore.WriteAsync(
                     SessionStateDocument.FromStatus(status, processId: 42),
                     cancellationToken);
+                terminalState = PublishTerminalStateAsync(session, cancellationToken);
             }
             catch (Exception exception)
             {
+                session = null;
                 await stateStore.WriteAsync(
-                    SessionStateDocument.Failed(launchedSessionId, launchedRequest, exception.Message),
+                    SessionStateDocument.Failed(
+                        launchedSessionId,
+                        launchedRequest,
+                        exception.Message,
+                        exception is LiveSessionException sessionException
+                            ? sessionException.Code
+                            : "session-start-failed"),
                     cancellationToken);
             }
+        }
+
+        private async Task PublishTerminalStateAsync(
+            InProcessLiveSessionController activeSession,
+            CancellationToken cancellationToken)
+        {
+            var status = await activeSession.WaitForTerminalStatusAsync(cancellationToken);
+            session = null;
+            await stateStore.WriteAsync(
+                SessionStateDocument.FromStatus(status, processId: 42),
+                cancellationToken);
         }
 
         private sealed class ControlledCommandLock : IAsyncDisposable

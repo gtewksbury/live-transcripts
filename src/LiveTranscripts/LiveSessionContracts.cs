@@ -3,14 +3,17 @@ namespace LiveTranscripts;
 internal sealed record StartSessionRequest(
     string OutputPath,
     string MicrophoneId,
-    string PlaybackId);
+    string PlaybackId,
+    bool Append = false);
 
 internal sealed record LiveSessionStatus(
     string SessionId,
     string State,
     string OutputPath,
     string MicrophoneId,
-    string PlaybackId);
+    string PlaybackId,
+    string? ErrorCode = null,
+    string? ErrorMessage = null);
 
 internal interface ILiveSessionController
 {

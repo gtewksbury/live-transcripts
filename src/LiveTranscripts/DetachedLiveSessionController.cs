@@ -54,6 +54,13 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
                 "A live transcription session is already active.");
         }
 
+        if (!request.Append && File.Exists(request.OutputPath))
+        {
+            throw new LiveSessionException(
+                "transcript-already-exists",
+                "The transcript destination already exists. Use --append to preserve it.");
+        }
+
         var sessionId = sessionIdFactory();
         await stateStore.WriteAsync(
             SessionStateDocument.Starting(sessionId, request),
@@ -78,7 +85,7 @@ internal sealed class DetachedLiveSessionController : ILiveSessionController
             if (state?.SessionId == sessionId && state.State == "failed")
             {
                 throw new LiveSessionException(
-                    "session-start-failed",
+                    state.ErrorCode ?? "session-start-failed",
                     state.Error ?? "The live transcription worker failed during startup.");
             }
 
@@ -232,6 +239,10 @@ internal sealed class WindowsDetachedWorkerControl : IDetachedWorkerControl
         startInfo.ArgumentList.Add(request.MicrophoneId);
         startInfo.ArgumentList.Add("--playback");
         startInfo.ArgumentList.Add(request.PlaybackId);
+        if (request.Append)
+        {
+            startInfo.ArgumentList.Add("--append");
+        }
         var process = Process.Start(startInfo) ??
             throw new LiveSessionException(
                 "worker-start-failed",
@@ -336,7 +347,21 @@ internal static class ProductionSessionWorker
                 SessionStateDocument.FromStatus(status, Environment.ProcessId),
                 CancellationToken.None);
 
-            stopEvent.WaitOne();
+            var stopTask = Task.Run(stopEvent.WaitOne);
+            var terminalStatusTask = controller.WaitForTerminalStatusAsync(CancellationToken.None);
+            var completedTask = await Task.WhenAny(stopTask, terminalStatusTask);
+
+            if (completedTask == terminalStatusTask)
+            {
+                status = await terminalStatusTask;
+                await stateStore.WriteAsync(
+                    SessionStateDocument.FromStatus(status, Environment.ProcessId),
+                    CancellationToken.None);
+                stopEvent.Set();
+                await stopTask;
+                return 3;
+            }
+
             status = await controller.StopAsync(sessionId, CancellationToken.None) ?? status;
             await stateStore.WriteAsync(
                 SessionStateDocument.FromStatus(status, Environment.ProcessId),
@@ -357,7 +382,13 @@ internal static class ProductionSessionWorker
             }
 
             await stateStore.WriteAsync(
-                SessionStateDocument.Failed(sessionId, request, exception.Message),
+                SessionStateDocument.Failed(
+                    sessionId,
+                    request,
+                    exception.Message,
+                    exception is LiveSessionException sessionException
+                        ? sessionException.Code
+                        : "session-start-failed"),
                 CancellationToken.None);
             return 3;
         }
@@ -372,15 +403,26 @@ internal static class ProductionSessionWorker
         sessionId = string.Empty;
         request = null!;
 
-        if (arguments is not
-            ["worker", "--session", var parsedSessionId, "--output", var outputPath,
-             "--microphone", var microphoneId, "--playback", var playbackId])
+        var append = arguments.Length == 10 &&
+            string.Equals(arguments[9], "--append", StringComparison.Ordinal);
+
+        if (arguments.Length is not (9 or 10) ||
+            arguments[0] != "worker" ||
+            arguments[1] != "--session" ||
+            arguments[3] != "--output" ||
+            arguments[5] != "--microphone" ||
+            arguments[7] != "--playback" ||
+            (arguments.Length == 10 && !append))
         {
             return false;
         }
 
-        sessionId = parsedSessionId;
-        request = new StartSessionRequest(outputPath, microphoneId, playbackId);
+        sessionId = arguments[2];
+        request = new StartSessionRequest(
+            arguments[4],
+            arguments[6],
+            arguments[8],
+            append);
         return true;
     }
 }
@@ -392,10 +434,11 @@ internal sealed record SessionStateDocument(
     string MicrophoneId,
     string PlaybackId,
     int ProcessId,
+    string? ErrorCode,
     string? Error)
 {
     public static SessionStateDocument Starting(string sessionId, StartSessionRequest request) =>
-        new(sessionId, "starting", request.OutputPath, request.MicrophoneId, request.PlaybackId, 0, null);
+        new(sessionId, "starting", request.OutputPath, request.MicrophoneId, request.PlaybackId, 0, null, null);
 
     public static SessionStateDocument FromStatus(LiveSessionStatus status, int processId) =>
         new(
@@ -405,22 +448,25 @@ internal sealed record SessionStateDocument(
             status.MicrophoneId,
             status.PlaybackId,
             processId,
-            null);
+            status.ErrorCode,
+            status.ErrorMessage);
 
     public static SessionStateDocument Failed(
         string sessionId,
         StartSessionRequest request,
-        string error) => new(
+        string error,
+        string errorCode = "session-start-failed") => new(
             sessionId,
             "failed",
             request.OutputPath,
             request.MicrophoneId,
             request.PlaybackId,
             Environment.ProcessId,
+            errorCode,
             error);
 
     public LiveSessionStatus ToStatus() =>
-        new(SessionId, State, OutputPath, MicrophoneId, PlaybackId);
+        new(SessionId, State, OutputPath, MicrophoneId, PlaybackId, ErrorCode, Error);
 }
 
 internal sealed class SessionStateStore : ISessionStateStore

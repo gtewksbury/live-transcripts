@@ -49,6 +49,7 @@ internal sealed class InProcessLiveSessionController(
     private readonly Func<string> createSessionId = sessionIdFactory ?? (() => Guid.NewGuid().ToString("N"));
     private LiveTranscriptionSession? session;
     private LiveSessionStatus? status;
+    private TaskCompletionSource<LiveSessionStatus>? terminalStatus;
 
     public async Task<LiveSessionStatus> StartAsync(
         StartSessionRequest request,
@@ -70,6 +71,9 @@ internal sealed class InProcessLiveSessionController(
                 request,
                 audioCaptureFactory,
                 speechRecognizerFactory);
+            candidate.WriteFailed += HandleWriteFailure;
+            terminalStatus = new TaskCompletionSource<LiveSessionStatus>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
 
             try
             {
@@ -77,6 +81,7 @@ internal sealed class InProcessLiveSessionController(
             }
             catch
             {
+                candidate.WriteFailed -= HandleWriteFailure;
                 await candidate.DisposeAsync();
                 throw;
             }
@@ -125,6 +130,7 @@ internal sealed class InProcessLiveSessionController(
                 return null;
             }
 
+            session.WriteFailed -= HandleWriteFailure;
             await session.StopAsync(cancellationToken);
             await session.DisposeAsync();
             session = null;
@@ -139,6 +145,58 @@ internal sealed class InProcessLiveSessionController(
 
     private bool Matches(string? sessionId) => status is not null &&
         (sessionId is null || string.Equals(sessionId, status.SessionId, StringComparison.Ordinal));
+
+    internal Task<LiveSessionStatus> WaitForTerminalStatusAsync(
+        CancellationToken cancellationToken) => terminalStatus is null
+            ? Task.FromException<LiveSessionStatus>(new InvalidOperationException("The session has not started."))
+            : terminalStatus.Task.WaitAsync(cancellationToken);
+
+    private void HandleWriteFailure(LiveSessionException exception) =>
+        _ = TransitionToWriteFailureAsync(exception);
+
+    private async Task TransitionToWriteFailureAsync(LiveSessionException exception)
+    {
+        await gate.WaitAsync(CancellationToken.None);
+
+        try
+        {
+            if (session is null || status is null)
+            {
+                return;
+            }
+
+            session.WriteFailed -= HandleWriteFailure;
+
+            try
+            {
+                await session.StopAsync(CancellationToken.None);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                await session.DisposeAsync();
+            }
+            catch
+            {
+            }
+
+            session = null;
+            status = status with
+            {
+                State = "failed",
+                ErrorCode = exception.Code,
+                ErrorMessage = exception.Message,
+            };
+            terminalStatus!.TrySetResult(status);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
 }
 
 internal sealed class LiveTranscriptionSession : IAsyncDisposable
@@ -149,6 +207,7 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
     private readonly ISpeechRecognizer youRecognizer;
     private readonly ISpeechRecognizer meetingRecognizer;
     private readonly object writerGate = new();
+    private int writeFailureSignaled;
 
     public LiveTranscriptionSession(
         StartSessionRequest request,
@@ -162,13 +221,33 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
         meetingRecognizer = speechRecognizerFactory.Create(TranscriptSource.Meeting);
     }
 
+    public event Action<LiveSessionException>? WriteFailed;
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await File.WriteAllTextAsync(
-            request.OutputPath,
-            $"# Live Transcript{Environment.NewLine}{Environment.NewLine}",
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            cancellationToken);
+        Directory.CreateDirectory(Path.GetDirectoryName(request.OutputPath)!);
+        var heading = $"# Live Transcript{Environment.NewLine}{Environment.NewLine}";
+
+        if (request.Append && File.Exists(request.OutputPath))
+        {
+            await File.AppendAllTextAsync(
+                request.OutputPath,
+                $"{Environment.NewLine}{Environment.NewLine}---{Environment.NewLine}{Environment.NewLine}{heading}",
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                cancellationToken);
+        }
+        else
+        {
+            await using var stream = new FileStream(
+                request.OutputPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.Read);
+            await using var writer = new StreamWriter(
+                stream,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            await writer.WriteAsync(heading.AsMemory(), cancellationToken);
+        }
 
         microphoneCapture.AudioAvailable += youRecognizer.WriteAudio;
         playbackCapture.AudioAvailable += meetingRecognizer.WriteAudio;
@@ -211,17 +290,34 @@ internal sealed class LiveTranscriptionSession : IAsyncDisposable
 
     private void WriteFinalized(string label, string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
+        if (string.IsNullOrWhiteSpace(text) || Volatile.Read(ref writeFailureSignaled) != 0)
         {
             return;
         }
 
-        lock (writerGate)
+        try
         {
-            File.AppendAllText(
-                request.OutputPath,
-                $"**{label}:** {text.Trim()}{Environment.NewLine}{Environment.NewLine}",
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            lock (writerGate)
+            {
+                if (!File.Exists(request.OutputPath))
+                {
+                    throw new IOException("The transcript destination is no longer available.");
+                }
+
+                File.AppendAllText(
+                    request.OutputPath,
+                    $"**{label}:** {text.Trim()}{Environment.NewLine}{Environment.NewLine}",
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            if (Interlocked.Exchange(ref writeFailureSignaled, 1) == 0)
+            {
+                WriteFailed?.Invoke(new LiveSessionException(
+                    "transcript-write-failed",
+                    $"The transcript could not be written: {exception.Message}"));
+            }
         }
     }
 }

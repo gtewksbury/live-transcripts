@@ -132,7 +132,8 @@ internal sealed class CliApplication
         var request = new StartSessionRequest(
             Path.GetFullPath(arguments.OutputPath),
             microphone.Id,
-            playback.Id);
+            playback.Id,
+            arguments.Append);
         LiveSessionStatus status;
 
         try
@@ -223,15 +224,30 @@ internal sealed class CliApplication
         LiveSessionStatus status,
         TextWriter standardOutput)
     {
-        var result = new
-        {
-            Success = true,
-            status.SessionId,
-            status.State,
-            status.OutputPath,
-            status.MicrophoneId,
-            status.PlaybackId,
-        };
+        object result = status.ErrorCode is null
+            ? new
+            {
+                Success = true,
+                status.SessionId,
+                status.State,
+                status.OutputPath,
+                status.MicrophoneId,
+                status.PlaybackId,
+            }
+            : new
+            {
+                Success = true,
+                status.SessionId,
+                status.State,
+                status.OutputPath,
+                status.MicrophoneId,
+                status.PlaybackId,
+                Error = new
+                {
+                    Code = status.ErrorCode,
+                    Message = status.ErrorMessage,
+                },
+            };
 
         return standardOutput.WriteLineAsync(JsonSerializer.Serialize(result, JsonOptions));
     }
@@ -258,9 +274,16 @@ internal sealed class CliApplication
 
         string? microphoneId = null;
         string? playbackId = null;
+        var append = false;
 
-        for (var index = 2; index < arguments.Length; index += 2)
+        for (var index = 2; index < arguments.Length; index++)
         {
+            if (string.Equals(arguments[index], "--append", StringComparison.Ordinal) && !append)
+            {
+                append = true;
+                continue;
+            }
+
             if (index + 1 >= arguments.Length)
             {
                 return false;
@@ -277,9 +300,11 @@ internal sealed class CliApplication
                 default:
                     return false;
             }
+
+            index++;
         }
 
-        parsed = new StartArguments(arguments[1], microphoneId, playbackId);
+        parsed = new StartArguments(arguments[1], microphoneId, playbackId, append);
         return true;
     }
 
@@ -348,5 +373,6 @@ internal sealed class CliApplication
     private readonly record struct StartArguments(
         string OutputPath,
         string? MicrophoneId,
-        string? PlaybackId);
+        string? PlaybackId,
+        bool Append);
 }
