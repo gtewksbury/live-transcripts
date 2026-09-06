@@ -2,3 +2,4 @@ bin/
 obj/
 TestResults/
 .vs/
+/src/LiveTranscripts/appsettings.json

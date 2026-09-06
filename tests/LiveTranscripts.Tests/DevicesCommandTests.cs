@@ -74,9 +74,11 @@ public sealed class DevicesCommandTests
 
         Assert.AreEqual(1, exitCode);
         Assert.AreEqual(
-            "{\"success\":false,\"error\":{\"code\":\"invalid-arguments\",\"message\":\"Expected the 'devices' command.\"}}",
+            "{\"success\":false,\"error\":{\"code\":\"invalid-arguments\",\"message\":\"Expected a devices, start, status, or stop command.\"}}",
             standardOutput.ToString().TrimEnd());
-        Assert.AreEqual($"Usage: LiveTranscripts devices{Environment.NewLine}", standardError.ToString());
+        Assert.AreEqual(
+            $"Usage: LiveTranscripts <devices|start|status|stop>{Environment.NewLine}",
+            standardError.ToString());
     }
 
     [TestMethod]

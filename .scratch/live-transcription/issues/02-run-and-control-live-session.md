@@ -9,7 +9,7 @@
 - [ ] `start` accepts an output path plus optional `--microphone` and `--playback` endpoint IDs; omitted IDs resolve to the Windows communications defaults.
 - [ ] The selected microphone and playback endpoints are pinned for the life of the session rather than following later default-device changes.
 - [ ] Production capture uses NAudio microphone capture for `You` and WASAPI loopback capture for `Meeting`, including all audio played through the selected endpoint.
-- [ ] Separate Azure AI Speech streams recognize the two sources using fixed `en-US`, inherited `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION` values, and verbatim profanity.
+- [ ] Separate Azure AI Speech streams recognize the two sources using fixed `en-US`, `AzureSpeech:Key` and `AzureSpeech:Region` values from `appsettings.json`, and verbatim profanity.
 - [ ] `start` detaches the worker and returns a machine-readable session ID only after the output, both captures, and both recognizers report ready.
 - [ ] Only finalized, non-empty recognition results are written as separate `**You:**` or `**Meeting:**` Markdown paragraphs; interim and no-match results are ignored.
 - [ ] `status` reports the sole active session when no ID is supplied and reports the matching session when the optional ID is supplied; an explicit mismatched ID fails clearly.

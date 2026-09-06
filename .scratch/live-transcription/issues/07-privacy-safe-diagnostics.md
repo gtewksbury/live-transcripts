@@ -8,7 +8,7 @@
 
 - [ ] Operational logs rotate under the current user's application-data location with documented size or retention bounds.
 - [ ] Logs capture session lifecycle transitions, selected device IDs, sanitized Azure error codes, and transcript write failures with enough context to diagnose the failed operation.
-- [ ] Logs never contain recognized transcript text, interim hypotheses, raw or encoded audio, `AZURE_SPEECH_KEY`, or other credential values.
+- [ ] Logs never contain recognized transcript text, interim hypotheses, raw or encoded audio, `AzureSpeech:Key`, or other credential values.
 - [ ] Command results and retained session status follow the same redaction rules and never expose inherited secret values.
 - [ ] Logging failures cannot write diagnostics to standard output or terminate an otherwise healthy transcription session.
 - [ ] Automated tests inject recognizable secret, transcript, and audio sentinels through success and failure paths and prove they are absent from logs, status, and command diagnostics.

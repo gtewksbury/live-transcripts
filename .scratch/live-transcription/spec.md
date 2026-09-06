@@ -61,7 +61,7 @@ The application is delivered as a self-contained .NET 10 Windows x64 executable 
 41. As an agent, I want degraded recognition reflected in status, so that I can detect trouble before the session ends.
 42. As an agent, I want transcription to stop if the Markdown document becomes unwritable, so that Azure usage cannot continue while output is lost.
 43. As an operator, I want diagnostic logs to exclude transcript text and audio, so that operational troubleshooting does not duplicate sensitive meeting content.
-44. As an operator, I want Azure credentials accepted through environment variables rather than command arguments, so that secrets are not exposed in process listings or session state.
+44. As an operator, I want Azure credentials accepted through executable-local configuration rather than command arguments, so that secrets are not exposed in process listings or session state.
 45. As an operator, I want the application to use an existing approved Azure resource, so that it does not provision or select cloud infrastructure itself.
 46. As an agent developer, I want a self-contained executable at a predictable path, so that agents can invoke it without installing a .NET runtime or modifying `PATH`.
 
@@ -75,7 +75,7 @@ The application is delivered as a self-contained .NET 10 Windows x64 executable 
 - Pin resolved endpoints for the session. Do not follow Windows default-device changes. A removed or invalidated endpoint is a terminal session error.
 - Use two independent Azure AI Speech recognition streams so source identity is preserved without remote-speaker diarization.
 - Use fixed `en-US` recognition with no language option or automatic language detection.
-- Configure Azure Speech with `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION`. Inherit them when spawning the detached worker, but do not persist or echo the key.
+- Configure Azure Speech with `AzureSpeech:Key` and `AzureSpeech:Region` from `appsettings.json` beside the executable. Do not pass or echo the key in command arguments, results, session state, or diagnostics.
 - Assume the Azure Speech resource already exists and is approved. Do not provision Azure infrastructure.
 - Preserve profanity in recognition output. Ignore interim hypotheses and no-match events; only finalized non-empty utterances enter the transcript.
 - Merge finalized results from both recognition streams using monotonic audio offsets and an approximately 500 millisecond holdback. Internal timing exists only for ordering and is never rendered in Markdown.
@@ -128,7 +128,7 @@ The application is delivered as a self-contained .NET 10 Windows x64 executable 
 - Persisting raw audio, durable offline transcription queues, or later reprocessing of meeting recordings.
 - More than one simultaneous transcription session per Windows user.
 - Runtime consent prompts or consent-attestation command options.
-- Azure resource provisioning, Azure deployment automation, and credential management beyond environment variables.
+- Azure resource provisioning, Azure deployment automation, and credential management beyond executable-local configuration.
 - A system service, graphical interface, notification-area application, installer, .NET global tool, package feed, or automatic `PATH` configuration.
 - Supporting concurrent external edits to the transcript while capture is active.
 

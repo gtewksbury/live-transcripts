@@ -10,6 +10,6 @@
 - [ ] The packaged executable runs on a supported Windows 11 x64 machine without a separately installed .NET runtime, installer, global tool package, or `PATH` change.
 - [ ] A Windows-only automated smoke test invokes the packaged executable as a child process and verifies command parsing, JSON-only standard output, standard-error isolation, and meaningful exit codes.
 - [ ] Documentation gives agents the full-path invocation contract for `devices`, `start`, `status`, and `stop`, including append and device override options.
-- [ ] Documentation covers Azure environment variables without showing real credentials, fixed `en-US` recognition, the two-hour limit, and the operator's responsibility for authorization and participant consent.
+- [ ] Documentation covers Azure Speech configuration without showing real credentials, fixed `en-US` recognition, the two-hour limit, and the operator's responsibility for authorization and participant consent.
 - [ ] Documentation prominently explains headset-first setup, Windows communications defaults, whole-endpoint playback capture, possible unrelated notification audio, `You` versus `Meeting` attribution, lack of named remote speakers, and expected two-to-five-second latency.
 - [ ] A manual smoke procedure verifies real microphone capture, WASAPI loopback capture, both Azure recognition streams, live concurrent reading, graceful stop, and final status on a Windows 11 meeting setup.
