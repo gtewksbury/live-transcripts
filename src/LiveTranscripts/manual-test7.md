@@ -12,3 +12,5 @@
 
 **Meeting:** Programmer either and vibe coding if we define it here is you tell an agent to build software for you.
 
+**You:** Alright, one SEC.
+
