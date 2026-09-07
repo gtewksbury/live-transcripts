@@ -32,7 +32,6 @@ internal sealed class ProcessLiveTranscriptsCommandRunner(
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
-            RedirectStandardError = true,
         };
 
         foreach (var argument in arguments)
@@ -43,24 +42,26 @@ internal sealed class ProcessLiveTranscriptsCommandRunner(
         using var process = new Process { StartInfo = startInfo };
         process.Start();
 
-        var standardOutput = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-        var standardError = process.StandardError.ReadToEndAsync(CancellationToken.None);
         using var timeout = new CancellationTokenSource(DefaultTimeout);
+        var standardOutput = process.StandardOutput.ReadLineAsync(timeout.Token).AsTask();
 
         try
         {
             await process.WaitForExitAsync(timeout.Token);
+            return new LiveTranscriptsCommandResult(
+                process.ExitCode,
+                await standardOutput ?? string.Empty,
+                string.Empty);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
-            process.Kill(entireProcessTree: true);
-            await process.WaitForExitAsync(CancellationToken.None);
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
+
             throw new TimeoutException("The live-transcripts CLI command timed out.");
         }
-
-        return new LiveTranscriptsCommandResult(
-            process.ExitCode,
-            await standardOutput,
-            await standardError);
     }
 }

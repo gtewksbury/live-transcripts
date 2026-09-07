@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="src/LiveTranscripts.Api/LiveTranscripts.Api.csproj" />
   <Project Path="src/LiveTranscripts/LiveTranscripts.csproj" />
+  <Project Path="tests/LiveTranscripts.ProcessFixture/LiveTranscripts.ProcessFixture.csproj" />
   <Project Path="tests/LiveTranscripts.Tests/LiveTranscripts.Tests.csproj" />
 </Solution>

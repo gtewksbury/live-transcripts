@@ -89,7 +89,7 @@ internal sealed class CliApplication
         };
 
         await standardOutput.WriteLineAsync(JsonSerializer.Serialize(failure, JsonOptions));
-        await standardError.WriteLineAsync("Usage: LiveTranscripts <devices|start|status|stop>");
+        await standardError.WriteLineAsync("Usage: live-transcripts <devices|start|status|stop>");
         return 1;
     }
 

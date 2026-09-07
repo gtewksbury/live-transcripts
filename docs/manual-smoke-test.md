@@ -14,30 +14,37 @@ Use this procedure for a release candidate on a supported Windows 11 x64 meeting
 
 1. Publish from the repository root and configure the generated `appsettings.json` with the approved resource key and Azure region:
 
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-windows.ps1
-   $LiveTranscripts = (Resolve-Path ".\artifacts\windows-x64\LiveTranscripts.exe").Path
+   ```bash
+   rm -rf ./artifacts/windows-x64
+   dotnet publish ./src/LiveTranscripts/LiveTranscripts.csproj \
+     --configuration Release \
+     --property:PublishProfile=WindowsX64 \
+     --nologo
+   LIVE_TRANSCRIPTS="$(cygpath -am ./artifacts/windows-x64/live-transcripts.exe)"
    ```
 
 2. List devices and confirm the intended headset microphone and playback endpoint have `isDefaultCommunications` set to `true`:
 
-   ```powershell
-   & $LiveTranscripts devices
+   ```bash
+   "$LIVE_TRANSCRIPTS" devices
    ```
 
 3. Start a meeting with another participant or a controlled remote audio source. Start transcription to a new path. Add `--microphone` and `--playback` with IDs from `devices` if the meeting does not use the Windows defaults:
 
-   ```powershell
-   $Started = & $LiveTranscripts start "$env:TEMP\live-transcripts-smoke.md" | ConvertFrom-Json
-   $Started
+   ```bash
+   OUTPUT_PATH="$(cygpath -am /tmp/live-transcripts-smoke.md)"
+   STARTED_JSON="$("$LIVE_TRANSCRIPTS" start "$OUTPUT_PATH")"
+   START_EXIT=$?
+   printf '%s\nexit=%s\n' "$STARTED_JSON" "$START_EXIT"
+   SESSION_ID="<session-id-from-start>"
    ```
 
    Verify exit code `0`, `success: true`, state `running`, and the expected microphone and playback IDs.
 
-4. In a second PowerShell window, read the file while capture remains active:
+4. In a second Git Bash window, read the file while capture remains active:
 
-   ```powershell
-   Get-Content $Started.outputPath -Wait
+   ```bash
+   tail -f /tmp/live-transcripts-smoke.md
    ```
 
 5. Speak a distinctive sentence into the physical microphone. Ask the remote participant to speak a different sentence through the selected playback endpoint. Verify both finalized results appear while the session is active, normally within two to five seconds:
@@ -48,17 +55,18 @@ Use this procedure for a release candidate on a supported Windows 11 x64 meeting
 
 6. Stop gracefully using the returned session ID:
 
-   ```powershell
-   $Stopped = & $LiveTranscripts stop $Started.sessionId | ConvertFrom-Json
-   $Stopped
+   ```bash
+   STOPPED_JSON="$("$LIVE_TRANSCRIPTS" stop "$SESSION_ID")"
+   STOP_EXIT=$?
+   printf '%s\nexit=%s\n' "$STOPPED_JSON" "$STOP_EXIT"
    ```
 
    Verify exit code `0`, state `stopped`, and stop reason `requested`. Confirm the live reader receives any final utterance and the process exits.
 
 7. Query the retained final status:
 
-   ```powershell
-   & $LiveTranscripts status $Started.sessionId
+   ```bash
+   "$LIVE_TRANSCRIPTS" status "$SESSION_ID"
    ```
 
    Verify the final status remains `stopped`, reports the same selected devices and output path, and contains no recognized text or Azure key.

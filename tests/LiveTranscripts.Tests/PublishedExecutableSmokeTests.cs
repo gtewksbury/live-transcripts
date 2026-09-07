@@ -38,7 +38,7 @@ public sealed class PublishedExecutableSmokeTests
             repositoryRoot,
             "artifacts",
             "windows-x64",
-            "LiveTranscripts.exe");
+            "live-transcripts.exe");
         Assert.IsTrue(File.Exists(executable), $"Published executable not found at {executable}.");
 
         var devices = await RunProcessAsync(executable, repositoryRoot, "devices");
@@ -60,7 +60,7 @@ public sealed class PublishedExecutableSmokeTests
             "invalid-arguments",
             result.RootElement.GetProperty("error").GetProperty("code").GetString());
         Assert.AreEqual(
-            $"Usage: LiveTranscripts <devices|start|status|stop>{Environment.NewLine}",
+            $"Usage: live-transcripts <devices|start|status|stop>{Environment.NewLine}",
             command.StandardError);
     }
 

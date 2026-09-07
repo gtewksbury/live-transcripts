@@ -17,4 +17,4 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Output "Published LiveTranscripts.exe to $artifactPath"
+Write-Output "Published live-transcripts.exe to $artifactPath"

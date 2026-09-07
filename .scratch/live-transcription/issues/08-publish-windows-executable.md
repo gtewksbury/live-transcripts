@@ -16,4 +16,4 @@
 
 ## Answer
 
-Added a deterministic Windows x64 single-file publish script and profile that write `LiveTranscripts.exe` plus a credential-free executable-local configuration to `artifacts/windows-x64`. Added a Windows-only packaged-process smoke test for successful and invalid commands, documented the full-path agent contract and operating constraints, and provided an operator-run physical-device and Azure Speech smoke procedure. Automated validation passes 36 of 36 tests in Release configuration; real meeting hardware and Azure verification remains the explicit manual release step.
+Added a deterministic Windows x64 single-file publish script and profile that write `live-transcripts.exe` plus a credential-free executable-local configuration to `artifacts/windows-x64`. Added a Windows-only packaged-process smoke test for successful and invalid commands, documented the full-path agent contract and operating constraints, and provided an operator-run physical-device and Azure Speech smoke procedure. Automated validation passes 36 of 36 tests in Release configuration; real meeting hardware and Azure verification remains the explicit manual release step.

@@ -77,7 +77,7 @@ public sealed class DevicesCommandTests
             "{\"success\":false,\"error\":{\"code\":\"invalid-arguments\",\"message\":\"Expected a devices, start, status, or stop command.\"}}",
             standardOutput.ToString().TrimEnd());
         Assert.AreEqual(
-            $"Usage: LiveTranscripts <devices|start|status|stop>{Environment.NewLine}",
+            $"Usage: live-transcripts <devices|start|status|stop>{Environment.NewLine}",
             standardError.ToString());
     }
 

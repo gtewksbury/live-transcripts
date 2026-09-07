@@ -18,6 +18,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\LiveTranscripts.Api\LiveTranscripts.Api.csproj" />
     <ProjectReference Include="..\..\src\LiveTranscripts\LiveTranscripts.csproj" />
+    <ProjectReference Include="..\LiveTranscripts.ProcessFixture\LiveTranscripts.ProcessFixture.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

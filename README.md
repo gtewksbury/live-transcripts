@@ -12,15 +12,16 @@ Recognition is fixed to `en-US`, and finalized text normally appears after appro
 
 ## Publish
 
-On a Windows x64 build machine with the .NET 10 SDK, run from the repository root:
+On a Windows x64 build machine with Git Bash and the .NET 10 SDK, run from the repository root:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-windows.ps1
+```bash
+rm -rf ./artifacts/windows-x64
+dotnet publish ./src/LiveTranscripts/LiveTranscripts.csproj --configuration Release --property:PublishProfile=WindowsX64 --nologo
 ```
 
-The script creates one self-contained executable at `artifacts\windows-x64\LiveTranscripts.exe`. The release also contains a credential-free `appsettings.json`. The target Windows 11 x64 machine does not need a separately installed .NET runtime, an installer, a global tool, or a `PATH` change.
+The command creates one self-contained executable at `artifacts/windows-x64/live-transcripts.exe`. The release also contains a credential-free `appsettings.json`. The target Windows 11 x64 machine does not need a separately installed .NET runtime, an installer, a global tool, or a `PATH` change.
 
-Each publish replaces the artifact directory. Set Azure credentials after publishing by editing `artifacts\windows-x64\appsettings.json`:
+Each publish replaces the artifact directory. Set Azure credentials after publishing by editing `artifacts/windows-x64/appsettings.json`:
 
 ```json
 {
@@ -33,45 +34,53 @@ Each publish replaces the artifact directory. Set Azure credentials after publis
 
 Keep the configured file beside the executable. Do not commit, log, or pass the key as a command argument.
 
+## Run the API
+
+From the repository root, run:
+
+```bash
+dotnet run --project ./src/LiveTranscripts.Api/LiveTranscripts.Api.csproj --configuration Release
+```
+
 ## Agent invocation
 
 Resolve the full executable path once, then use that path for every operation:
 
-```powershell
-$LiveTranscripts = (Resolve-Path ".\artifacts\windows-x64\LiveTranscripts.exe").Path
+```bash
+LIVE_TRANSCRIPTS="$(cygpath -am ./artifacts/windows-x64/live-transcripts.exe)"
 ```
 
 List available endpoints and their communications-default status:
 
-```powershell
-& $LiveTranscripts devices
+```bash
+"$LIVE_TRANSCRIPTS" devices
 ```
 
 Start with the Windows communications defaults:
 
-```powershell
-& $LiveTranscripts start "C:\transcripts\meeting.md"
+```bash
+"$LIVE_TRANSCRIPTS" start "C:/transcripts/meeting.md"
 ```
 
 Append a visibly separated session to an existing document:
 
-```powershell
-& $LiveTranscripts start "C:\transcripts\meeting.md" --append
+```bash
+"$LIVE_TRANSCRIPTS" start "C:/transcripts/meeting.md" --append
 ```
 
 Override either or both endpoint IDs using values returned by `devices`:
 
-```powershell
-& $LiveTranscripts start "C:\transcripts\meeting.md" --microphone "<microphone-id>" --playback "<playback-id>"
+```bash
+"$LIVE_TRANSCRIPTS" start "C:/transcripts/meeting.md" --microphone "<microphone-id>" --playback "<playback-id>"
 ```
 
 Query or stop the sole current session, or supply the `sessionId` returned by `start`:
 
-```powershell
-& $LiveTranscripts status
-& $LiveTranscripts status "<session-id>"
-& $LiveTranscripts stop
-& $LiveTranscripts stop "<session-id>"
+```bash
+"$LIVE_TRANSCRIPTS" status
+"$LIVE_TRANSCRIPTS" status "<session-id>"
+"$LIVE_TRANSCRIPTS" stop
+"$LIVE_TRANSCRIPTS" stop "<session-id>"
 ```
 
 A successful command exits with code `0`. Invalid arguments, unavailable devices, missing sessions, session-operation failures, and unexpected failures use nonzero exit codes. Always parse standard output as JSON and treat standard error as diagnostic text only.
